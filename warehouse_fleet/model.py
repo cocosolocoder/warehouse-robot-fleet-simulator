@@ -40,6 +40,7 @@ class Task:
     assigned_robot: str | None = None
     picked_up: bool = False
     completed: bool = False
+    paused: bool = False
 
 
 @dataclass(slots=True)
@@ -53,4 +54,21 @@ class Robot:
     @property
     def idle(self) -> bool:
         return self.task_id is None
+
+
+@dataclass(frozen=True, slots=True)
+class MapChange:
+    """A single effective map modification applied between two ticks.
+
+    ``tick`` is the number of ticks already executed when the change took
+    effect (so a change made right after tick ``t`` has effective tick
+    ``t``). ``added`` and ``removed`` hold the cells that actually became
+    blocked or open: duplicate submissions and no-ops (adding an already
+    blocked cell, removing an already open one) are filtered out, so a
+    change is only recorded when at least one cell really flips.
+    """
+
+    tick: int
+    added: frozenset[Position]
+    removed: frozenset[Position]
 
