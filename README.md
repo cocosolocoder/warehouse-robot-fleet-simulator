@@ -23,6 +23,53 @@ python3 -m unittest discover -s tests -v
 The public Python API exposes `GridMap`, `Robot`, `Task`, `FleetSimulator`, and
 `shortest_path` for programmatic scenarios.
 
+## Closing and reopening cells at runtime
+
+Between ticks you may change the map with one batch call. The edit takes effect
+immediately but neither advances the clock, moves a robot, nor adds mileage:
+
+```python
+simulator.modify_obstacles(added=[(3, 2), (3, 3)], removed=[(5, 4)])
+```
+
+Coordinates must be plain two-integer pairs (booleans are not integers). The
+whole request is validated up front and rejected with `ValueError` if a
+coordinate is out of bounds or malformed, a cell is both added and removed, or
+a newly added obstacle covers a robot's current cell; on rejection the map,
+routes, tasks, statistics and history are all left untouched. Duplicate
+coordinates inside one batch are processed once; adding an already blocked
+cell or removing a traversable cell is a no-op, and a batch with no actual
+effect produces no change record.
+
+After an accepted edit every assigned, unfinished task keeps its robot. A robot
+that has not picked up replans a shortest feasible route from its current cell
+through the pickup point to the dropoff (a robot already at the pickup point
+collects first at the next step); a robot carrying goods routes straight to the
+dropoff and never returns to a subsequently closed pickup cell. If any required
+cell is unreachable, the robot's remaining route is cleared and the task is
+*paused* — it is neither driven along a stale route, released, nor completed.
+Unassigned tasks whose points are unreachable simply keep waiting and never
+block other tasks. The next `step()` after cells reopen automatically resumes
+paused driving and assigns waiting tasks; collision avoidance still applies and
+robots never enter a new obstacle.
+
+Queries and history:
+
+```python
+simulator.status()              # current obstacles + paused task ids
+simulator.map_change_history()  # effective tick, adds/removes, order
+```
+
+`status()` reports tasks paused because the map made their route infeasible,
+which is distinct from a robot briefly waiting for another robot to clear the
+way. Every *actual* change is stored both in the dedicated history and in the
+replay as a `map_change` event carrying the tick it took effect at, its global
+sequence number (consecutive edits at the same tick keep their order), and the
+added/removed cells; ordinary tick frames keep their original positions and
+completion data and are never rewritten by later maps. Identical initial state
+with an identical sequence of steps and edits always produces identical
+routes, replay and statistics.
+
 ## Saving and resuming progress
 
 State can be saved after any tick and resumed later in a new process. From
@@ -57,28 +104,44 @@ updated state; without it the source file is left untouched, and naming the
 same file updates it in place. Both commands print the same JSON snapshot and
 report any load/save error on standard error with a non-zero exit code.
 
-### Checkpoint file format (version 1)
+### Checkpoint file format (version 2)
 
 Checkpoints are UTF-8 encoded JSON. The top-level object contains:
 
-- `version` — integer format version, currently `1`.
-- `grid` — `{"width", "height", "obstacles"}`, where obstacles is a list of
-  `[x, y]` cells.
+- `version` — integer format version, currently `2`. Version `1` files remain
+  loadable and are interpreted as having no map-modification history.
+- `grid` — `{"width", "height", "obstacles"}`, the map *currently in effect*,
+  where obstacles is a list of `[x, y]` cells.
+- `base_grid` — same shape as `grid`; the map before any runtime edit. Replaying
+  the change history against it must reproduce `grid`.
 - `tick` — number of ticks already executed.
 - `robots` — list of `{"robot_id", "position", "route", "task_id",
   "distance_travelled"}`; `position` is `[x, y]` and `route` is the remaining
-  waypoints after the current position.
+  waypoints after the current position (empty for a paused robot).
 - `tasks` — list of `{"task_id", "pickup", "dropoff", "assigned_robot",
   "picked_up", "completed"}`. Completed tasks keep their historical
   `assigned_robot`; unassigned tasks use `null`.
-- `replay` — per-tick frames `{"tick", "moved", "robots", "completed"}`,
-  numbered consecutively from `1` through `tick`. In any non-zero-tick file the
-  last frame's robot positions must equal the current robot positions.
+- `paused_tasks` — ids of tasks whose assigned robot currently cannot reach a
+  required point on the saved map.
+- `map_changes` — every actual edit in order, each
+  `{"tick", "sequence", "added", "removed"}`; `sequence` runs from 1 and
+  consecutive edits at the same `tick` preserve their order.
+- `replay` — ordered events. Tick frames are `{"type": "tick", "tick", "moved",
+  "robots", "completed"}`, numbered consecutively from `1` through `tick`.
+  Map-change frames are interspersed at their effective tick and have the shape
+  `{"type": "map_change", "tick", "sequence", "added", "removed"}`. In any
+  non-zero-tick file the last tick frame's robot positions must equal the
+  current robot positions; historical frames are never overwritten by later
+  maps.
 
 Loading validates the entire document: corrupted JSON, missing or wrongly
 typed fields, unsupported versions, duplicate robot or task ids, overlapping
 or out-of-bounds/blocked robot positions, routes that leave the map, cross
-obstacles, or make non-adjacent moves, task/robot ownership mismatches, and a
-broken replay history are all rejected.
+obstacles, or make non-adjacent moves, task/robot ownership mismatches, a
+broken replay history, out-of-bounds or add/remove-conflicting change records,
+a change history that does not reproduce the saved grid, and an inconsistent
+paused-task state are all rejected. Version 1 documents contain tick frames
+without a `type` field and none of the edit-related keys; they load as if no
+map edit had ever happened.
 
 

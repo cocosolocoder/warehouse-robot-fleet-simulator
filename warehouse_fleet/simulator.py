@@ -1,16 +1,22 @@
-"""Task assignment and collision-aware tick execution.
+"""Task assignment, dynamic map edits and collision-aware tick execution.
+
+Obstacles may be closed and reopened between ticks through
+:meth:`FleetSimulator.modify_obstacles`. Every accepted edit is appended to a
+deterministic change history and mirrored into the replay as a ``map_change``
+event stamped with the tick at which it took effect. Tick frames themselves are
+never rewritten, so historical frames keep the positions and completion
+information recorded at the time.
 
 Checkpoint file format
 ----------------------
-``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current (and
-first) format version is ``1``. A checkpoint document is a JSON object with
-these keys:
+``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current format
+version is ``2``; version ``1`` files remain readable.
 
 ``version``
-    Integer format version, currently ``1``.
+    Integer format version (``1`` or ``2``).
 ``grid``
     ``{"width": int, "height": int, "obstacles": [[x, y], ...]}`` describing
-    the map dimensions and every blocked cell.
+    the map dimensions and every currently blocked cell.
 ``tick``
     Non-negative integer: the number of ticks already executed. Saving and
     loading never advance this value.
@@ -25,18 +31,33 @@ these keys:
     "assigned_robot": str | null, "picked_up": bool, "completed": bool}``.
     Completed tasks keep their historical ``assigned_robot``.
 ``replay``
-    List of per-tick event frames in execution order. Frames are numbered
-    consecutively from ``1`` through ``tick`` and each has the shape
-    ``{"tick": int, "moved": [robot_id, ...],
-    "robots": {robot_id: [x, y], ...}, "completed": [task_id, ...]}``. When
-    ``tick`` is non-zero the final frame's robot positions must match the
-    current robot positions.
+    Ordered event list. Tick events are numbered consecutively from ``1``
+    through ``tick`` and have the shape
+    ``{"type": "tick", "tick": int, "moved": [robot_id, ...],
+    "robots": {robot_id: [x, y], ...}, "completed": [task_id, ...]}``.
+    Map-change events sit between ticks (or after the last tick) and look like
+    ``{"type": "map_change", "tick": int, "sequence": int,
+    "added": [[x, y], ...], "removed": [[x, y], ...]}``. When ``tick`` is
+    non-zero the final tick event's robot positions must match the current
+    robot positions.
+``map_changes`` (version 2 only)
+    List mirroring the replay map-change events in the same order:
+    ``{"tick": int, "sequence": int, "added": [...], "removed": [...]}``.
+``base_grid`` (version 2 only)
+    ``{"width", "height", "obstacles"}`` describing the map before any runtime
+    edit. Replaying ``map_changes`` against it must reproduce the saved current
+    ``grid``.
+
+Version 1 documents store tick frames without a ``type`` field and have no
+``map_changes`` or ``base_grid`` key; they load with their grid taken as the
+baseline, as if no map edit ever happened.
 
 Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
-mismatches, and broken replay history all raise :class:`ValueError`. Filesystem
-and permission failures propagate as :class:`OSError`.
+mismatches, broken replay or map-change history, and a history that does not
+reproduce the saved grid all raise :class:`ValueError`. Filesystem and
+permission failures propagate as :class:`OSError`.
 """
 
 from __future__ import annotations
@@ -48,16 +69,28 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
-from .model import GridMap, Robot, Task
+from .model import GridMap, Position, Robot, Task
 from .pathfinding import shortest_path
 
-CHECKPOINT_VERSION = 1
-_SUPPORTED_VERSIONS = frozenset({CHECKPOINT_VERSION})
+CHECKPOINT_VERSION = 2
+_LEGACY_VERSIONS = frozenset({1})
+_SUPPORTED_VERSIONS = frozenset({CHECKPOINT_VERSION}) | _LEGACY_VERSIONS
 
 
 def _is_int(value: object) -> bool:
     """JSON booleans are ints in Python; checkpoints treat them as wrong."""
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _as_cell(value: object, description: str) -> Position:
+    """Validate a user supplied coordinate as a two-integer pair."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+        raise ValueError(f"{description} must be a [x, y] integer pair")
+    if len(value) != 2:
+        raise ValueError(f"{description} must be a [x, y] integer pair")
+    if not all(_is_int(coord) for coord in value):
+        raise ValueError(f"{description} coordinates must be integers, not booleans or other types")
+    return value[0], value[1]
 
 
 def _as_pair(value: object, description: str) -> tuple[int, int]:
@@ -73,15 +106,167 @@ def _as_pair(value: object, description: str) -> tuple[int, int]:
 class FleetSimulator:
     def __init__(self, grid: GridMap, robots: list[Robot], tasks: list[Task]) -> None:
         self.grid = grid
+        # The map as built before any runtime edit; map-change history is
+        # replayed against this baseline.
+        self.base_grid = grid
         self.robots = {robot.robot_id: robot for robot in robots}
         self.tasks = {task.task_id: task for task in tasks}
         self.tick = 0
         self.replay: list[dict[str, object]] = []
+        self.map_changes: list[dict[str, object]] = []
+        self._map_sequence = 0
+        self.paused_tasks: set[str] = set()
         positions = [robot.position for robot in robots]
         if len(positions) != len(set(positions)):
             raise ValueError("robots cannot share an initial position")
         if any(not grid.traversable(position) for position in positions):
             raise ValueError("robot starts outside traversable map space")
+
+    # ------------------------------------------------------------------
+    # Dynamic map edits
+    # ------------------------------------------------------------------
+
+    def modify_obstacles(
+        self,
+        added: Sequence[Position] = (),
+        removed: Sequence[Position] = (),
+    ) -> dict[str, object]:
+        """Close and/or reopen cells without advancing the simulation.
+
+        The whole request is validated before anything changes: coordinates
+        must be two plain integers (booleans are rejected), lie inside the
+        map, no cell may appear in both lists, and newly added obstacles may
+        not cover a robot's current cell. Duplicate coordinates inside one
+        batch are processed once. Adding an existing obstacle or removing a
+        traversable cell is a no-op. Invalid requests raise :class:`ValueError`
+        and leave every part of the state untouched.
+
+        Assigned unfinished tasks keep their robot: routes are replanned
+        against the new map, or, when a required point is unreachable, cleared
+        while the task is suspended. No tick is recorded, no robot moves and no
+        distance is accumulated.
+        """
+        add_cells = self._normalize_cells(added, "added")
+        remove_cells = self._normalize_cells(removed, "removed")
+        conflict = set(add_cells) & set(remove_cells)
+        if conflict:
+            cell = sorted(conflict)[0]
+            raise ValueError(
+                f"cell {list(cell)} is both added and removed in the same request"
+            )
+        occupied = {robot.position for robot in self.robots.values()}
+        for cell in add_cells:
+            if cell in occupied:
+                raise ValueError(
+                    f"cannot add obstacle at {list(cell)}: a robot currently occupies it"
+                )
+        return self._apply_map_change(add_cells, remove_cells)
+
+    def _normalize_cells(self, cells: Sequence[Position], label: str) -> list[Position]:
+        if isinstance(cells, (str, bytes)) or not isinstance(cells, (list, tuple)):
+            raise ValueError(f"{label} cells must be provided as a list of [x, y] pairs")
+        seen: set[Position] = set()
+        ordered: list[Position] = []
+        for index, cell in enumerate(cells):
+            position = _as_cell(cell, f"{label} cell {index}")
+            if not self.grid.contains(position):
+                raise ValueError(f"{label} cell {list(position)} lies outside the map")
+            if position in seen:
+                # Batch-internal duplicates are handled once, not rejected.
+                continue
+            seen.add(position)
+            ordered.append(position)
+        return ordered
+
+    def _apply_map_change(
+        self, added: list[Position], removed: list[Position]
+    ) -> dict[str, object]:
+        obstacles = set(self.grid.obstacles)
+        actual_added = [cell for cell in added if cell not in obstacles]
+        obstacles.update(actual_added)
+        actual_removed = [cell for cell in removed if cell in obstacles]
+        obstacles.difference_update(actual_removed)
+        if not actual_added and not actual_removed:
+            return self._map_change_record(self._map_sequence, [], [])
+
+        # Everything below only runs once the batch was fully validated and is
+        # known to change the map.
+        self.grid = GridMap(self.grid.width, self.grid.height, frozenset(obstacles))
+        self._map_sequence += 1
+        record = self._map_change_record(self._map_sequence, actual_added, actual_removed)
+        self.map_changes.append(copy.deepcopy(record))
+        self.replay.append(copy.deepcopy(record))
+        self._reroute_after_map_change()
+        return copy.deepcopy(record)
+
+    def _map_change_record(
+        self, sequence: int, added: list[Position], removed: list[Position]
+    ) -> dict[str, object]:
+        return {
+            "type": "map_change",
+            "tick": self.tick,
+            "sequence": sequence,
+            "added": [list(cell) for cell in added],
+            "removed": [list(cell) for cell in removed],
+        }
+
+    def _plan_route(self, robot: Robot, task: Task) -> list[Position] | None:
+        """Shortest current->pickup->dropoff route, or None if unreachable."""
+        try:
+            if not task.picked_up:
+                if robot.position == task.pickup:
+                    to_pickup: list[Position] = []
+                else:
+                    to_pickup = shortest_path(self.grid, robot.position, task.pickup)
+                to_dropoff = shortest_path(self.grid, task.pickup, task.dropoff)
+            else:
+                # Goods are already on board: a reclosed pickup cell must not
+                # pull the robot back.
+                to_pickup = []
+                to_dropoff = shortest_path(self.grid, robot.position, task.dropoff)
+        except ValueError:
+            return None
+        return to_pickup + to_dropoff
+
+    def _reroute_after_map_change(self) -> None:
+        for task in self.tasks.values():
+            if task.completed or task.assigned_robot is None:
+                continue
+            robot = self.robots[task.assigned_robot]
+            if robot.task_id != task.task_id:
+                continue
+            route = self._plan_route(robot, task)
+            if route is None:
+                robot.route = []
+                self.paused_tasks.add(task.task_id)
+            else:
+                # Only the route is refreshed here; pickup/delivery are
+                # confirmed at step start (or were already recorded).
+                robot.route = route
+                self.paused_tasks.discard(task.task_id)
+
+    def _recover_paused_tasks(self) -> None:
+        """Resume tasks suspended by map unreachability where possible."""
+        for task_id in sorted(self.paused_tasks):
+            task = self.tasks.get(task_id)
+            if task is None or task.completed or task.assigned_robot is None:
+                self.paused_tasks.discard(task_id)
+                continue
+            robot = self.robots[task.assigned_robot]
+            if robot.task_id != task.task_id:
+                self.paused_tasks.discard(task_id)
+                continue
+            route = self._plan_route(robot, task)
+            if route is None:
+                robot.route = []
+                continue
+            robot.route = route
+            self.paused_tasks.discard(task_id)
+            self._finish_if_arrived(robot)
+
+    # ------------------------------------------------------------------
+    # Normal execution
+    # ------------------------------------------------------------------
 
     def assign_tasks(self) -> None:
         """Assign pending tasks to the nearest idle robot using stable tie breaks."""
@@ -98,6 +283,8 @@ class FleetSimulator:
                     continue
                 choices.append((len(route), robot.robot_id, route))
             if not choices:
+                # No robot can reach this task yet; it keeps waiting and does
+                # not block assignment of other tasks.
                 continue
             _, robot_id, route = min(choices)
             robot = self.robots[robot_id]
@@ -105,17 +292,43 @@ class FleetSimulator:
             robot.route = route
             task.assigned_robot = robot_id
 
+    def _confirm_pickups(self) -> None:
+        """A robot starting a tick on its pickup point collects first."""
+        for robot in self.robots.values():
+            if robot.task_id is None:
+                continue
+            task = self.tasks[robot.task_id]
+            if not task.completed and not task.picked_up and robot.position == task.pickup:
+                task.picked_up = True
+
     def step(self) -> dict[str, object]:
+        self._confirm_pickups()
+        self._recover_paused_tasks()
         self.assign_tasks()
         occupied = {robot.position for robot in self.robots.values()}
         reserved: set[tuple[int, int]] = set()
         moved: list[str] = []
         for robot in sorted(self.robots.values(), key=lambda item: item.robot_id):
+            task = self.tasks[robot.task_id] if robot.task_id is not None else None
+            if task is not None and task.task_id in self.paused_tasks:
+                continue
             if not robot.route:
                 self._finish_if_arrived(robot)
                 continue
             destination = robot.route[0]
+            if not self.grid.traversable(destination):
+                # Defensive: routes are normally replanned on every map edit.
+                if task is not None and not task.completed:
+                    route = self._plan_route(robot, task)
+                    if route is None:
+                        robot.route = []
+                        self.paused_tasks.add(task.task_id)
+                    else:
+                        robot.route = route
+                continue
             if destination in reserved or (destination in occupied and destination != robot.position):
+                # Another robot is in the way; the task stays active and this
+                # is distinct from a map-unreachability pause.
                 continue
             occupied.remove(robot.position)
             robot.position = destination
@@ -126,7 +339,8 @@ class FleetSimulator:
             moved.append(robot.robot_id)
             self._finish_if_arrived(robot)
         self.tick += 1
-        event = {
+        event: dict[str, object] = {
+            "type": "tick",
             "tick": self.tick,
             "moved": moved,
             "robots": {robot_id: list(robot.position) for robot_id, robot in sorted(self.robots.items())},
@@ -139,10 +353,13 @@ class FleetSimulator:
         if robot.task_id is None:
             return
         task = self.tasks[robot.task_id]
+        if task.task_id in self.paused_tasks:
+            return
         if robot.position == task.pickup:
             task.picked_up = True
         if task.picked_up and robot.position == task.dropoff and not robot.route:
             task.completed = True
+            self.paused_tasks.discard(task.task_id)
             robot.task_id = None
 
     def metrics(self) -> dict[str, object]:
@@ -151,9 +368,24 @@ class FleetSimulator:
             "ticks": self.tick,
             "tasks_total": len(self.tasks),
             "tasks_completed": completed,
+            "tasks_paused": sorted(self.paused_tasks),
             "completion_ratio": completed / len(self.tasks) if self.tasks else 1.0,
             "distance_total": sum(robot.distance_travelled for robot in self.robots.values()),
         }
+
+    def status(self) -> dict[str, object]:
+        """Current obstacles and tasks suspended due to map unreachability."""
+        return {
+            "tick": self.tick,
+            "width": self.grid.width,
+            "height": self.grid.height,
+            "obstacles": [list(cell) for cell in sorted(self.grid.obstacles)],
+            "paused_tasks": sorted(self.paused_tasks),
+        }
+
+    def map_change_history(self) -> list[dict[str, object]]:
+        """Effective time, added/removed cells and order of every actual edit."""
+        return copy.deepcopy(self.map_changes)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -183,6 +415,11 @@ class FleetSimulator:
                 "height": self.grid.height,
                 "obstacles": [list(cell) for cell in sorted(self.grid.obstacles)],
             },
+            "base_grid": {
+                "width": self.base_grid.width,
+                "height": self.base_grid.height,
+                "obstacles": [list(cell) for cell in sorted(self.base_grid.obstacles)],
+            },
             "tick": self.tick,
             "robots": [
                 {
@@ -206,6 +443,8 @@ class FleetSimulator:
                 for task in sorted(self.tasks.values(), key=lambda item: item.task_id)
             ],
             "replay": copy.deepcopy(self.replay),
+            "map_changes": copy.deepcopy(self.map_changes),
+            "paused_tasks": sorted(self.paused_tasks),
         }
         payload = (json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
@@ -279,7 +518,20 @@ class FleetSimulator:
         grid = cls._load_grid(data)
         tick = cls._load_tick(data)
         robot_records, task_records = cls._load_entities(data)
-        replay = cls._load_replay(data)
+
+        map_changes: list[dict[str, object]] = []
+        paused: set[str] = set()
+        if version == 1:
+            replay = cls._load_legacy_replay(data)
+            base_grid = grid
+        else:
+            replay = cls._load_replay(data)
+            map_changes = cls._load_map_changes(data)
+            paused = cls._load_paused_tasks(data)
+            base_grid = cls._load_base_grid(data)
+            if (base_grid.width, base_grid.height) != (grid.width, grid.height):
+                raise ValueError("base grid dimensions must match the current grid")
+            cls._validate_map_history(base_grid, grid, map_changes)
 
         robots: list[Robot] = []
         for record in robot_records:
@@ -373,17 +625,27 @@ class FleetSimulator:
                         f"robot executes {owner.task_id!r}"
                     )
 
+        cls._validate_paused_state(paused, task_by_id, robot_by_id, grid)
+
+        replay_change_frames = cls._replay_map_change_frames(replay)
+        if replay_change_frames != map_changes:
+            raise ValueError("replay map-change frames do not match 'map_changes' history")
+
         simulator = cls(grid, robots, tasks)
+        simulator.base_grid = base_grid
         simulator.tick = tick
         simulator.replay = copy.deepcopy(replay)
+        simulator.map_changes = copy.deepcopy(map_changes)
+        simulator._map_sequence = len(map_changes)
+        simulator.paused_tasks = set(paused)
         cls._validate_replay_positions(replay, tick, robot_by_id)
         return simulator
 
     @staticmethod
-    def _require_field(data: Mapping[str, object], field: str) -> object:
-        if field not in data:
-            raise ValueError(f"checkpoint is missing required field {field!r}")
-        return data[field]
+    def _require_field(data: Mapping[str, object], field_name: str) -> object:
+        if field_name not in data:
+            raise ValueError(f"checkpoint is missing required field {field_name!r}")
+        return data[field_name]
 
     @classmethod
     def _load_grid(cls, data: Mapping[str, object]) -> GridMap:
@@ -409,6 +671,31 @@ class FleetSimulator:
             return GridMap(width, height, frozenset(obstacles))
         except ValueError as exc:
             raise ValueError(f"invalid checkpoint grid: {exc}") from exc
+
+    @classmethod
+    def _load_base_grid(cls, data: Mapping[str, object]) -> GridMap:
+        raw = cls._require_field(data, "base_grid")
+        if not isinstance(raw, dict):
+            raise ValueError("checkpoint field 'base_grid' must be an object")
+        width = raw.get("width")
+        height = raw.get("height")
+        if not _is_int(width) or width <= 0:
+            raise ValueError("checkpoint base grid width must be a positive integer")
+        if not _is_int(height) or height <= 0:
+            raise ValueError("checkpoint base grid height must be a positive integer")
+        raw_obstacles = raw.get("obstacles")
+        if not isinstance(raw_obstacles, list):
+            raise ValueError("checkpoint base grid 'obstacles' must be a list")
+        obstacles: set[tuple[int, int]] = set()
+        for index, cell in enumerate(raw_obstacles):
+            obstacle = _as_pair(cell, f"base obstacle entry {index}")
+            if not (0 <= obstacle[0] < width and 0 <= obstacle[1] < height):
+                raise ValueError(f"base obstacle {list(obstacle)} lies outside the map")
+            obstacles.add(obstacle)
+        try:
+            return GridMap(width, height, frozenset(obstacles))
+        except ValueError as exc:
+            raise ValueError(f"invalid checkpoint base grid: {exc}") from exc
 
     @classmethod
     def _load_tick(cls, data: Mapping[str, object]) -> int:
@@ -489,7 +776,261 @@ class FleetSimulator:
         return robot_records, task_records
 
     @classmethod
+    def _load_change_cells(
+        cls, raw: object, context: str, field_name: str
+    ) -> list[tuple[int, int]]:
+        if not isinstance(raw, list):
+            raise ValueError(f"{context} field {field_name!r} must be a list")
+        cells: list[tuple[int, int]] = []
+        for index, cell in enumerate(raw):
+            position = _as_pair(cell, f"{context} {field_name} entry {index}")
+            cells.append(position)
+        return cells
+
+    @classmethod
+    def _load_map_changes(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
+        raw = cls._require_field(data, "map_changes")
+        if not isinstance(raw, list):
+            raise ValueError("checkpoint field 'map_changes' must be a list")
+        changes: list[dict[str, object]] = []
+        last_tick = -1
+        last_sequence = 0
+        for index, frame in enumerate(raw):
+            context = f"map change {index}"
+            if not isinstance(frame, dict):
+                raise ValueError(f"{context} must be an object")
+            tick = frame.get("tick")
+            sequence = frame.get("sequence")
+            if not _is_int(tick) or tick < 0:
+                raise ValueError(f"{context} field 'tick' must be a non-negative integer")
+            if not _is_int(sequence) or sequence <= 0:
+                raise ValueError(f"{context} field 'sequence' must be a positive integer")
+            if sequence != index + 1:
+                raise ValueError(
+                    f"map change sequences must run consecutively from 1; change {index} "
+                    f"has sequence {sequence}, expected {index + 1}"
+                )
+            if tick < last_tick:
+                raise ValueError(
+                    f"{context} tick {tick} is earlier than a preceding map change"
+                )
+            if tick == last_tick and sequence != last_sequence + 1:
+                raise ValueError(f"{context} breaks consecutive sequencing at tick {tick}")
+            added = cls._load_change_cells(frame.get("added"), context, "added")
+            removed = cls._load_change_cells(frame.get("removed"), context, "removed")
+            if not added and not removed:
+                raise ValueError(f"{context} contains no actual obstacle changes")
+            overlap = set(added) & set(removed)
+            if overlap:
+                cell = sorted(overlap)[0]
+                raise ValueError(
+                    f"{context} adds and removes the same cell {list(cell)}"
+                )
+            changes.append(
+                {
+                    "type": "map_change",
+                    "tick": tick,
+                    "sequence": sequence,
+                    "added": [list(cell) for cell in added],
+                    "removed": [list(cell) for cell in removed],
+                }
+            )
+            last_tick = tick
+            last_sequence = sequence
+        return changes
+
+    @classmethod
+    def _validate_map_history(
+        cls,
+        base_grid: GridMap,
+        saved_grid: GridMap,
+        changes: Sequence[Mapping[str, object]],
+    ) -> None:
+        obstacles = set(base_grid.obstacles)
+        width, height = saved_grid.width, saved_grid.height
+        for frame in changes:
+            for key in ("added", "removed"):
+                for cell in frame[key]:
+                    x, y = cell
+                    if not (0 <= x < width and 0 <= y < height):
+                        raise ValueError(
+                            f"map change {frame['sequence']} cell {list(cell)} lies "
+                            "outside the map"
+                        )
+            added = {tuple(cell) for cell in frame["added"]}
+            removed = {tuple(cell) for cell in frame["removed"]}
+            for cell in added:
+                if cell in obstacles:
+                    raise ValueError(
+                        f"map change {frame['sequence']} adds obstacle {list(cell)} "
+                        "that is already present according to the history"
+                    )
+            for cell in removed:
+                if cell not in obstacles:
+                    raise ValueError(
+                        f"map change {frame['sequence']} removes obstacle {list(cell)} "
+                        "that is absent according to the history"
+                    )
+            obstacles |= added
+            obstacles -= removed
+        if obstacles != set(saved_grid.obstacles):
+            raise ValueError(
+                "the map reproduced from 'map_changes' does not match the saved grid"
+            )
+
+    @classmethod
+    def _replay_map_change_frames(
+        cls, replay: Sequence[Mapping[str, object]]
+    ) -> list[dict[str, object]]:
+        frames = [frame for frame in replay if frame.get("type") == "map_change"]
+        normalized = [
+            {
+                "type": "map_change",
+                "tick": frame["tick"],
+                "sequence": frame["sequence"],
+                "added": [list(cell) for cell in frame["added"]],
+                "removed": [list(cell) for cell in frame["removed"]],
+            }
+            for frame in frames
+        ]
+        return normalized
+
+    @classmethod
+    def _load_paused_tasks(cls, data: Mapping[str, object]) -> set[str]:
+        raw = cls._require_field(data, "paused_tasks")
+        if not isinstance(raw, list) or not all(isinstance(value, str) for value in raw):
+            raise ValueError("checkpoint field 'paused_tasks' must be a list of strings")
+        if len(raw) != len(set(raw)):
+            raise ValueError("checkpoint field 'paused_tasks' contains duplicates")
+        return set(raw)
+
+    @staticmethod
+    def _validate_paused_state(
+        paused: set[str],
+        task_by_id: Mapping[str, Task],
+        robot_by_id: Mapping[str, Robot],
+        grid: GridMap | None = None,
+    ) -> None:
+        for task_id in paused:
+            task = task_by_id.get(task_id)
+            if task is None:
+                raise ValueError(f"paused task {task_id!r} is not among the checkpoint tasks")
+            if task.completed:
+                raise ValueError(f"paused task {task_id!r} is already completed")
+            if task.assigned_robot is None:
+                raise ValueError(f"paused task {task_id!r} has no assigned robot")
+            owner = robot_by_id.get(task.assigned_robot)
+            if owner is None or owner.task_id != task_id:
+                raise ValueError(
+                    f"paused task {task_id!r} is not bound to its assigned robot"
+                )
+            if owner.route:
+                raise ValueError(
+                    f"paused task {task_id!r} robot must have an empty remaining route"
+                )
+            if grid is not None:
+                # A saved pause must reflect genuine unreachability on the
+                # saved map; otherwise the history is inconsistent.
+                reachable = True
+                try:
+                    if not task.picked_up:
+                        if owner.position != task.pickup:
+                            shortest_path(grid, owner.position, task.pickup)
+                        shortest_path(grid, task.pickup, task.dropoff)
+                    else:
+                        shortest_path(grid, owner.position, task.dropoff)
+                except ValueError:
+                    reachable = False
+                if reachable:
+                    raise ValueError(
+                        f"paused task {task_id!r} is actually reachable on the saved map"
+                    )
+
+    @classmethod
     def _load_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
+        raw = cls._require_field(data, "replay")
+        if not isinstance(raw, list):
+            raise ValueError("checkpoint field 'replay' must be a list")
+        replay: list[dict[str, object]] = []
+        tick_index = 0
+        last_map_tick = -1
+        last_map_sequence = 0
+        for index, frame in enumerate(raw):
+            if not isinstance(frame, dict):
+                raise ValueError(f"replay frame {index} must be an object")
+            frame_type = frame.get("type", "tick")
+            if frame_type == "tick":
+                tick_index += 1
+                frame_tick = frame.get("tick")
+                if not _is_int(frame_tick):
+                    raise ValueError(f"replay frame {index} field 'tick' must be an integer")
+                if frame_tick != tick_index:
+                    raise ValueError(
+                        "replay tick numbers must run consecutively from 1; frame "
+                        f"{index} has tick {frame_tick}, expected {tick_index}"
+                    )
+                cls._validate_tick_frame_payload(frame, frame_tick)
+                replay.append(frame)
+            elif frame_type == "map_change":
+                tick = frame.get("tick")
+                sequence = frame.get("sequence")
+                if not _is_int(tick) or tick < 0:
+                    raise ValueError(f"replay frame {index} map change tick must be a non-negative integer")
+                if not _is_int(sequence) or sequence <= 0:
+                    raise ValueError(f"replay frame {index} map change sequence must be positive")
+                if tick != tick_index:
+                    raise ValueError(
+                        f"replay map change {sequence} is stamped tick {tick} but appears "
+                        f"after {tick_index} tick frames"
+                    )
+                if tick < last_map_tick or (
+                    tick == last_map_tick and sequence != last_map_sequence + 1
+                ):
+                    raise ValueError(
+                        f"replay map change {sequence} is out of order at tick {tick}"
+                    )
+                added = cls._load_change_cells(frame.get("added"), f"replay frame {index}", "added")
+                removed = cls._load_change_cells(frame.get("removed"), f"replay frame {index}", "removed")
+                replay.append(
+                    {
+                        "type": "map_change",
+                        "tick": tick,
+                        "sequence": sequence,
+                        "added": [list(cell) for cell in added],
+                        "removed": [list(cell) for cell in removed],
+                    }
+                )
+                last_map_tick = tick
+                last_map_sequence = sequence
+            else:
+                raise ValueError(f"replay frame {index} has unknown type {frame_type!r}")
+        return replay
+
+    @staticmethod
+    def _validate_tick_frame_payload(frame: Mapping[str, object], frame_tick: int) -> None:
+        moved = frame.get("moved")
+        completed = frame.get("completed")
+        robots = frame.get("robots")
+        if not isinstance(moved, list) or not all(isinstance(value, str) for value in moved):
+            raise ValueError(f"replay frame {frame_tick} field 'moved' must be a list of strings")
+        if not isinstance(completed, list) or not all(
+            isinstance(value, str) for value in completed
+        ):
+            raise ValueError(
+                f"replay frame {frame_tick} field 'completed' must be a list of strings"
+            )
+        if not isinstance(robots, dict) or not all(
+            isinstance(key, str) and isinstance(value, list) for key, value in robots.items()
+        ):
+            raise ValueError(
+                f"replay frame {frame_tick} field 'robots' must be an object of "
+                "robot id to [x, y]"
+            )
+        for robot_id, position in robots.items():
+            _as_pair(position, f"replay frame {frame_tick} robot {robot_id!r} position")
+
+    @classmethod
+    def _load_legacy_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
         raw = cls._require_field(data, "replay")
         if not isinstance(raw, list):
             raise ValueError("checkpoint field 'replay' must be a list")
@@ -497,6 +1038,9 @@ class FleetSimulator:
         for index, frame in enumerate(raw):
             if not isinstance(frame, dict):
                 raise ValueError(f"replay frame {index} must be an object")
+            frame_type = frame.get("type", "tick")
+            if frame_type != "tick":
+                raise ValueError("version 1 checkpoints cannot contain map change frames")
             frame_tick = frame.get("tick")
             if not _is_int(frame_tick):
                 raise ValueError(f"replay frame {index} field 'tick' must be an integer")
@@ -505,27 +1049,10 @@ class FleetSimulator:
                     "replay tick numbers must run consecutively from 1; frame "
                     f"{index} has tick {frame_tick}, expected {index + 1}"
                 )
-            moved = frame.get("moved")
-            completed = frame.get("completed")
-            robots = frame.get("robots")
-            if not isinstance(moved, list) or not all(isinstance(value, str) for value in moved):
-                raise ValueError(f"replay frame {frame_tick} field 'moved' must be a list of strings")
-            if not isinstance(completed, list) or not all(
-                isinstance(value, str) for value in completed
-            ):
-                raise ValueError(
-                    f"replay frame {frame_tick} field 'completed' must be a list of strings"
-                )
-            if not isinstance(robots, dict) or not all(
-                isinstance(key, str) and isinstance(value, list) for key, value in robots.items()
-            ):
-                raise ValueError(
-                    f"replay frame {frame_tick} field 'robots' must be an object of "
-                    "robot id to [x, y]"
-                )
-            for robot_id, position in robots.items():
-                _as_pair(position, f"replay frame {frame_tick} robot {robot_id!r} position")
-            replay.append(frame)
+            cls._validate_tick_frame_payload(frame, frame_tick)
+            normalized = dict(frame)
+            normalized["type"] = "tick"
+            replay.append(normalized)
         return replay
 
     @staticmethod
@@ -534,12 +1061,13 @@ class FleetSimulator:
         tick: int,
         robot_by_id: Mapping[str, Robot],
     ) -> None:
-        if len(replay) != tick:
+        tick_frames = [frame for frame in replay if frame.get("type") == "tick"]
+        if len(tick_frames) != tick:
             raise ValueError(
-                f"replay has {len(replay)} frames but the checkpoint is at tick {tick}"
+                f"replay has {len(tick_frames)} tick frames but the checkpoint is at tick {tick}"
             )
         expected_ids = set(robot_by_id)
-        for frame in replay:
+        for frame in tick_frames:
             frame_positions = frame["robots"]
             assert isinstance(frame_positions, dict)
             if set(frame_positions) != expected_ids:
@@ -547,7 +1075,7 @@ class FleetSimulator:
                     f"replay frame {frame['tick']} robot ids do not match current robots"
                 )
         if tick > 0:
-            last = replay[-1]
+            last = tick_frames[-1]
             assert isinstance(last["robots"], dict)
             for robot_id, position in last["robots"].items():
                 if tuple(position) != robot_by_id[robot_id].position:

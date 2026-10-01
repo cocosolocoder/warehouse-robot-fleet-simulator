@@ -197,8 +197,18 @@ class CheckpointFormatTests(unittest.TestCase):
     def test_versioned_utf8_json_document(self) -> None:
         raw = Path(self.path).read_bytes()
         raw.decode("utf-8")
-        self.assertEqual(self.document["version"], 1)
-        for key in ("version", "grid", "tick", "robots", "tasks", "replay"):
+        self.assertEqual(self.document["version"], 2)
+        for key in (
+            "version",
+            "grid",
+            "base_grid",
+            "tick",
+            "robots",
+            "tasks",
+            "replay",
+            "map_changes",
+            "paused_tasks",
+        ):
             self.assertIn(key, self.document)
 
     def reload_expect_error(self, document: object, fragment: str) -> None:
@@ -229,8 +239,8 @@ class CheckpointFormatTests(unittest.TestCase):
             self.reload_expect_error(document, field)
 
     def test_unsupported_or_typed_wrong_version(self) -> None:
-        self.reload_expect_error(self.mutated(lambda d: d.update(version=2)), "version")
-        self.reload_expect_error(self.mutated(lambda d: d.update(version="1")), "version")
+        self.reload_expect_error(self.mutated(lambda d: d.update(version=3)), "version")
+        self.reload_expect_error(self.mutated(lambda d: d.update(version="2")), "version")
         self.reload_expect_error(self.mutated(lambda d: d.update(version=True)), "version")
 
     def test_field_type_errors(self) -> None:
