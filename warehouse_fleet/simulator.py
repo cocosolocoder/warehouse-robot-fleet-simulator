@@ -7,6 +7,12 @@ event stamped with the tick at which it took effect. Tick frames themselves are
 never rewritten, so historical frames keep the positions and completion
 information recorded at the time.
 
+When a robot's desired move is blocked by another vehicle it may step sideways
+into a free adjacent cell (a *yield* move) to let traffic pass, then replan its
+route. Idle blocking vehicles yield instead of the blocked robot stepping
+backward. Robots paused by map unreachability stay in place and never yield.
+Waiting accumulates only while blocked by another vehicle and resets on move.
+
 Checkpoint file format
 ----------------------
 ``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current format
@@ -23,8 +29,11 @@ version is ``2``; version ``1`` files remain readable.
 ``robots``
     List of robot states, each
     ``{"robot_id": str, "position": [x, y], "route": [[x, y], ...],
-    "task_id": str | null, "distance_travelled": int}``. ``route`` holds the
-    remaining waypoints after ``position``.
+    "task_id": str | null, "distance_travelled": int, "wait_ticks": int}``.
+    ``route`` holds the remaining waypoints after ``position``. ``wait_ticks``
+    is the consecutive number of ticks spent stationary because of traffic; it
+    resets on move and is zero when not waiting. Version 1 and older version 2
+    files without this field load with ``wait_ticks`` starting from zero.
 ``tasks``
     List of task states, each
     ``{"task_id": str, "pickup": [x, y], "dropoff": [x, y],
@@ -301,43 +310,284 @@ class FleetSimulator:
             if not task.completed and not task.picked_up and robot.position == task.pickup:
                 task.picked_up = True
 
+    def _goal_path(self, robot: Robot, task: Task) -> list[Position]:
+        """Shortest path from robot's current position to its final goal."""
+        try:
+            if task.picked_up:
+                return shortest_path(self.grid, robot.position, task.dropoff)
+            to_pickup: list[Position] = []
+            if robot.position != task.pickup:
+                to_pickup = shortest_path(self.grid, robot.position, task.pickup)
+            to_dropoff = shortest_path(self.grid, task.pickup, task.dropoff)
+            return to_pickup + to_dropoff
+        except ValueError:
+            return []
+
+    def _find_blocker(
+        self,
+        robot_id: str,
+        destination: Position,
+        moves: dict[str, tuple[Position, bool] | None],
+    ) -> Robot | None:
+        """Find the robot occupying or reserving *destination*."""
+        # A reservation by another robot's move is the strongest claim.
+        for other_id, move in moves.items():
+            if other_id == robot_id or move is None:
+                continue
+            if move[0] == destination:
+                return self.robots[other_id]
+        # Otherwise a staying robot physically occupies the cell.
+        for robot in self.robots.values():
+            if robot.robot_id == robot_id:
+                continue
+            if robot.position == destination and moves.get(robot.robot_id) is None:
+                return robot
+        return None
+
+    def _is_blocking_active(
+        self,
+        robot: Robot,
+        desired: dict[str, Position | None],
+        moves: dict[str, tuple[Position, bool] | None],
+    ) -> str | None:
+        """If *robot* (staying) blocks an active robot's move, return that robot's id."""
+        for other_id, destination in desired.items():
+            if other_id == robot.robot_id or destination is None:
+                continue
+            other = self.robots[other_id]
+            if other.task_id is None:
+                continue
+            task = self.tasks[other.task_id]
+            if task.task_id in self.paused_tasks or task.completed:
+                continue
+            if destination == robot.position and moves.get(other_id) is None:
+                return other_id
+        return None
+
+    def _find_yield_cell(
+        self,
+        robot: Robot,
+        desired: dict[str, Position | None],
+        goal_paths: dict[str, list[Position]],
+        moves: dict[str, tuple[Position, bool] | None],
+        restrict_distance: bool = False,
+    ) -> Position | None:
+        """Find a safe adjacent cell for *robot* to yield to, or None.
+
+        A yield cell must be traversable, not occupied or reserved, not another
+        robot's desired move, not on any other robot's shortest path, and must
+        not cause a swap. When *restrict_distance* is set the cell must not
+        increase the robot's own goal distance (used when blocked by an idle
+        robot, where stepping backward would only oscillate).
+        """
+        task = self.tasks[robot.task_id] if robot.task_id is not None else None
+        own_goal: Position | None = None
+        if task is not None and not task.completed:
+            own_goal = task.dropoff if task.picked_up else task.pickup
+
+        current_dist = 0
+        if own_goal is not None:
+            try:
+                current_dist = len(shortest_path(self.grid, robot.position, own_goal))
+            except ValueError:
+                current_dist = 0
+
+        candidates: list[tuple[int, Position]] = []
+        for neighbor in self.grid.neighbors(robot.position):
+            if neighbor in self._occupied_cells(moves):
+                continue
+            # Do not steal another robot's desired destination.
+            if any(dest == neighbor for dest in desired.values() if dest is not None):
+                continue
+            # Do not block another robot's shortest path.
+            on_path = False
+            for other_id, path in goal_paths.items():
+                if other_id == robot.robot_id:
+                    continue
+                if neighbor in path:
+                    on_path = True
+                    break
+            if on_path:
+                continue
+            # Do not swap: a staying robot at *neighbor* whose desired move is
+            # this robot's current position would exchange cells.
+            swap = False
+            for other in self.robots.values():
+                if other.robot_id == robot.robot_id:
+                    continue
+                if other.position == neighbor and moves.get(other.robot_id) is None:
+                    if desired.get(other.robot_id) == robot.position:
+                        swap = True
+                        break
+            if swap:
+                continue
+            dist = 0
+            if own_goal is not None:
+                try:
+                    dist = len(shortest_path(self.grid, neighbor, own_goal))
+                except ValueError:
+                    dist = 1 << 30
+            if restrict_distance and own_goal is not None and dist > current_dist:
+                continue
+            candidates.append((dist, neighbor))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][1]
+
+    def _occupied_cells(self, moves: dict[str, tuple[Position, bool] | None]) -> set[Position]:
+        """Cells that will be occupied after the current tick's moves."""
+        cells: set[Position] = set()
+        for robot in self.robots.values():
+            move = moves.get(robot.robot_id)
+            if move is not None:
+                cells.add(move[0])
+            else:
+                cells.add(robot.position)
+        return cells
+
     def step(self) -> dict[str, object]:
         self._confirm_pickups()
         self._recover_paused_tasks()
         self.assign_tasks()
-        occupied = {robot.position for robot in self.robots.values()}
-        reserved: set[tuple[int, int]] = set()
-        moved: list[str] = []
-        for robot in sorted(self.robots.values(), key=lambda item: item.robot_id):
+
+        # Desired move per robot: the next route waypoint, or None.
+        desired: dict[str, Position | None] = {}
+        goal_paths: dict[str, list[Position]] = {}
+        for robot in self.robots.values():
             task = self.tasks[robot.task_id] if robot.task_id is not None else None
             if task is not None and task.task_id in self.paused_tasks:
+                desired[robot.robot_id] = None
                 continue
-            if not robot.route:
-                self._finish_if_arrived(robot)
+            if robot.route:
+                desired[robot.robot_id] = robot.route[0]
+            else:
+                desired[robot.robot_id] = None
+            if task is not None and not task.completed:
+                goal_paths[robot.robot_id] = self._goal_path(robot, task)
+
+        moves: dict[str, tuple[Position, bool] | None] = {}
+        moved: list[str] = []
+
+        # Pass 1: grant safe desired moves.
+        for robot in sorted(self.robots.values(), key=lambda item: item.robot_id):
+            destination = desired[robot.robot_id]
+            if destination is None:
                 continue
-            destination = robot.route[0]
-            if not self.grid.traversable(destination):
-                # Defensive: routes are normally replanned on every map edit.
-                if task is not None and not task.completed:
-                    route = self._plan_route(robot, task)
-                    if route is None:
-                        robot.route = []
-                        self.paused_tasks.add(task.task_id)
-                    else:
-                        robot.route = route
+            if destination in self._occupied_cells(moves):
                 continue
-            if destination in reserved or (destination in occupied and destination != robot.position):
-                # Another robot is in the way; the task stays active and this
-                # is distinct from a map-unreachability pause.
-                continue
-            occupied.remove(robot.position)
-            robot.position = destination
-            robot.route.pop(0)
-            robot.distance_travelled += 1
-            occupied.add(destination)
-            reserved.add(destination)
+            moves[robot.robot_id] = (destination, False)
             moved.append(robot.robot_id)
+
+        # Pass 2: resolve blocked robots with yields.
+        for robot in sorted(self.robots.values(), key=lambda item: item.robot_id):
+            rid = robot.robot_id
+            if rid in moves:
+                continue
+            destination = desired[rid]
+            task = self.tasks[robot.task_id] if robot.task_id is not None else None
+
+            if destination is None:
+                # No desired move. Paused robots stay in place and never yield.
+                task = self.tasks[robot.task_id] if robot.task_id is not None else None
+                if task is not None and task.task_id in self.paused_tasks:
+                    moves[rid] = None
+                    robot.wait_ticks = 0
+                    robot.blocked_by = None
+                    continue
+                # If this robot blocks an active robot, yield.
+                blocked_id = self._is_blocking_active(robot, desired, moves)
+                if blocked_id is not None:
+                    yield_cell = self._find_yield_cell(
+                        robot, desired, goal_paths, moves
+                    )
+                    if yield_cell is not None:
+                        moves[rid] = (yield_cell, True)
+                        moved.append(rid)
+                        robot.wait_ticks = 0
+                        robot.blocked_by = None
+                        continue
+                # Not moving for traffic reasons: wait count resets.
+                moves[rid] = None
+                robot.wait_ticks = 0
+                robot.blocked_by = None
+                continue
+
+            # Check if destination is now free: another robot processed earlier
+            # in this pass may have yielded away from it.
+            if destination not in self._occupied_cells(moves):
+                moves[rid] = (destination, False)
+                moved.append(rid)
+                robot.wait_ticks = 0
+                robot.blocked_by = None
+                continue
+
+            # Destination is blocked. Identify the blocker.
+            blocker = self._find_blocker(rid, destination, moves)
+            blocker_active = False
+            if blocker is not None and blocker.task_id is not None:
+                blocker_task = self.tasks[blocker.task_id]
+                if blocker_task.task_id not in self.paused_tasks and not blocker_task.completed:
+                    blocker_active = True
+
+            # If the blocker is idle (no task), make it yield instead of the
+            # blocked robot stepping backward into an oscillation.
+            if blocker is not None and blocker.robot_id not in moves and not blocker_active:
+                yield_cell = self._find_yield_cell(
+                    blocker, desired, goal_paths, moves
+                )
+                if yield_cell is not None:
+                    moves[blocker.robot_id] = (yield_cell, True)
+                    moved.append(blocker.robot_id)
+                    blocker.wait_ticks = 0
+                    blocker.blocked_by = None
+                    if destination not in self._occupied_cells(moves):
+                        moves[rid] = (destination, False)
+                        moved.append(rid)
+                        robot.wait_ticks = 0
+                        robot.blocked_by = None
+                        continue
+
+            # The blocked robot tries to yield. When blocked by an active robot
+            # it may step sideways even if that temporarily increases its goal
+            # distance; when blocked by an idle robot it may only step closer.
+            yield_cell = self._find_yield_cell(
+                robot,
+                desired,
+                goal_paths,
+                moves,
+                restrict_distance=not blocker_active,
+            )
+            if yield_cell is not None:
+                moves[rid] = (yield_cell, True)
+                moved.append(rid)
+                robot.wait_ticks = 0
+                robot.blocked_by = None
+            else:
+                moves[rid] = None
+                robot.wait_ticks += 1
+                robot.blocked_by = blocker.robot_id if blocker is not None else None
+
+        # Apply moves.
+        for robot in self.robots.values():
+            move = moves.get(robot.robot_id)
+            if move is None:
+                continue
+            destination, is_yield = move
+            robot.position = destination
+            if is_yield:
+                task = self.tasks[robot.task_id] if robot.task_id is not None else None
+                if task is not None and not task.completed:
+                    robot.route = self._plan_route(robot, task) or []
+            elif robot.route:
+                robot.route.pop(0)
+            robot.distance_travelled += 1
+            # Any move clears the traffic-wait counter.
+            robot.wait_ticks = 0
+            robot.blocked_by = None
             self._finish_if_arrived(robot)
+
         self.tick += 1
         event: dict[str, object] = {
             "type": "tick",
@@ -374,13 +624,29 @@ class FleetSimulator:
         }
 
     def status(self) -> dict[str, object]:
-        """Current obstacles and tasks suspended due to map unreachability."""
+        """Current obstacles, map-unreachability pauses and traffic waits.
+
+        ``traffic_wait`` lists every robot that has been stationary for one or
+        more consecutive ticks because another vehicle blocked its desired
+        move, with the blocking robot's id and the consecutive wait count.
+        """
+        traffic_wait: list[dict[str, object]] = []
+        for robot in sorted(self.robots.values(), key=lambda item: item.robot_id):
+            if robot.wait_ticks > 0:
+                traffic_wait.append(
+                    {
+                        "robot_id": robot.robot_id,
+                        "blocked_by": robot.blocked_by,
+                        "wait_ticks": robot.wait_ticks,
+                    }
+                )
         return {
             "tick": self.tick,
             "width": self.grid.width,
             "height": self.grid.height,
             "obstacles": [list(cell) for cell in sorted(self.grid.obstacles)],
             "paused_tasks": sorted(self.paused_tasks),
+            "traffic_wait": traffic_wait,
         }
 
     def map_change_history(self) -> list[dict[str, object]]:
@@ -428,6 +694,7 @@ class FleetSimulator:
                     "route": [list(cell) for cell in robot.route],
                     "task_id": robot.task_id,
                     "distance_travelled": robot.distance_travelled,
+                    "wait_ticks": robot.wait_ticks,
                 }
                 for robot in sorted(self.robots.values(), key=lambda item: item.robot_id)
             ],
@@ -565,7 +832,22 @@ class FleetSimulator:
                     f"robot {record['robot_id']!r} distance_travelled must be a "
                     "non-negative integer"
                 )
-            robots.append(Robot(record["robot_id"], position, route, record["task_id"], distance))
+            wait_ticks = record.get("wait_ticks", 0)
+            if not _is_int(wait_ticks) or wait_ticks < 0:
+                raise ValueError(
+                    f"robot {record['robot_id']!r} wait_ticks must be a "
+                    "non-negative integer"
+                )
+            robots.append(
+                Robot(
+                    record["robot_id"],
+                    position,
+                    route,
+                    record["task_id"],
+                    distance,
+                    wait_ticks,
+                )
+            )
 
         tasks: list[Task] = []
         for record in task_records:

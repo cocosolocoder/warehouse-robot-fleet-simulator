@@ -49,6 +49,13 @@ class Robot:
     route: list[Position] = field(default_factory=list)
     task_id: str | None = None
     distance_travelled: int = 0
+    # Consecutive ticks spent stationary because another robot blocked the
+    # desired move. Reset to zero whenever the robot moves or the blockage
+    # clears. Not persisted in checkpoints (recomputed on load).
+    wait_ticks: int = 0
+    # robot_id of the vehicle currently blocking this one, or None. Transient:
+    # recomputed every tick and never written to disk.
+    blocked_by: str | None = None
 
     @property
     def idle(self) -> bool:

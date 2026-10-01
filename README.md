@@ -56,19 +56,47 @@ robots never enter a new obstacle.
 Queries and history:
 
 ```python
-simulator.status()              # current obstacles + paused task ids
+simulator.status()              # current obstacles + paused tasks + traffic waits
 simulator.map_change_history()  # effective tick, adds/removes, order
 ```
 
-`status()` reports tasks paused because the map made their route infeasible,
-which is distinct from a robot briefly waiting for another robot to clear the
-way. Every *actual* change is stored both in the dedicated history and in the
+`status()` distinguishes two kinds of interruption. A task is *paused* when the
+map made its route infeasible (e.g. a required cell was closed); paused robots
+stay in place and never yield. A robot is *traffic waiting* when another vehicle
+blocks its desired move; `status()` lists each waiting robot with the blocking
+vehicle's id and the number of consecutive ticks it has been stationary. The
+wait count resets to zero as soon as the robot moves or the blockage clears.
+
+## Automatic yielding
+
+When a robot's desired move is blocked by another vehicle, it does not simply
+wait forever. If a safe adjacent side cell is free — one that is traversable,
+not occupied or reserved, not another robot's desired destination, and not on
+any other robot's shortest path — the robot may step into it as a *yield* move.
+After yielding the robot replans its route from the new position and continues.
+Yield moves obey the same safety rules as every move: at most one adjacent cell
+per tick, no two robots end on the same cell, no position swaps, and no passing
+through obstacles. Yield moves count toward mileage; waiting does not.
+
+When the blocking vehicle is idle (has no task), it is the idle vehicle that
+yields to let the active robot pass, rather than the active robot stepping
+backward into an oscillation. Idle vehicles that yield generate no task, stay
+in the side cell once the way is clear, and remain available for new
+assignments. Robots paused by map unreachability stay in place and never yield.
+
+If no safe yield cell exists (e.g. the side cell is closed and the corridor is
+narrow), the robots wait: `step()` still advances time and preserves tasks and
+cargo, with no collisions or false completion. Reopening a closed side cell
+lets the robots try to pass again on the next tick; stale yield routes are never
+reused.
+
+Every *actual* change is stored both in the dedicated history and in the
 replay as a `map_change` event carrying the tick it took effect at, its global
 sequence number (consecutive edits at the same tick keep their order), and the
 added/removed cells; ordinary tick frames keep their original positions and
 completion data and are never rewritten by later maps. Identical initial state
 with an identical sequence of steps and edits always produces identical
-routes, replay and statistics.
+routes, replay and statistics, independent of robot or task list ordering.
 
 ## Saving and resuming progress
 
@@ -116,8 +144,12 @@ Checkpoints are UTF-8 encoded JSON. The top-level object contains:
   the change history against it must reproduce `grid`.
 - `tick` — number of ticks already executed.
 - `robots` — list of `{"robot_id", "position", "route", "task_id",
-  "distance_travelled"}`; `position` is `[x, y]` and `route` is the remaining
-  waypoints after the current position (empty for a paused robot).
+  "distance_travelled", "wait_ticks"}`; `position` is `[x, y]` and `route` is
+  the remaining waypoints after the current position (empty for a paused robot).
+  `wait_ticks` is the number of consecutive ticks the robot has spent
+  stationary because of traffic; it resets on move and is `0` when the robot is
+  not waiting. Version 1 and older version 2 files without this field load with
+  `wait_ticks` starting from `0`.
 - `tasks` — list of `{"task_id", "pickup", "dropoff", "assigned_robot",
   "picked_up", "completed"}`. Completed tasks keep their historical
   `assigned_robot`; unassigned tasks use `null`.
