@@ -7,6 +7,22 @@ event stamped with the tick at which it took effect. Tick frames themselves are
 never rewritten, so historical frames keep the positions and completion
 information recorded at the time.
 
+Automatic yielding
+------------------
+When a robot's next waypoint is occupied by another robot, ``step()`` tries to
+keep traffic flowing instead of waiting forever: an idle blocker is asked to
+move onto a free side cell that lies on no robot's planned route, and a busy
+robot facing a blocker that cannot drive on may itself sidestep onto a free
+adjacent cell and replan its (still shortest) route from there. Yield moves
+count as mileage, waiting does not. The task keeps its original robot, pickup
+and completion rules are unchanged, and a robot paused by map unreachability
+never takes part in yielding. If no safe side cell exists the robots simply
+wait: time advances, nothing collides and nothing completes early. Waiting
+caused purely by other robots is tracked per robot (consecutive ticks and the
+blocking robot) and reported by :meth:`FleetSimulator.status` and
+:meth:`FleetSimulator.metrics` as ``traffic_waits``, distinct from the
+map-unreachability ``paused_tasks``.
+
 Checkpoint file format
 ----------------------
 ``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current format
@@ -47,6 +63,11 @@ version is ``2``; version ``1`` files remain readable.
     ``{"width", "height", "obstacles"}`` describing the map before any runtime
     edit. Replaying ``map_changes`` against it must reproduce the saved current
     ``grid``.
+``traffic_waits`` (optional)
+    List of ``{"robot_id": str, "blocked_by": [str, ...], "ticks": int}``
+    entries recording how many consecutive ticks each robot has been held up
+    purely by other robots. Absent in older files, which load with every
+    wait counter at zero.
 
 Version 1 documents store tick frames without a ``type`` field and have no
 ``map_changes`` or ``base_grid`` key; they load with their grid taken as the
@@ -116,6 +137,9 @@ class FleetSimulator:
         self.map_changes: list[dict[str, object]] = []
         self._map_sequence = 0
         self.paused_tasks: set[str] = set()
+        # Consecutive per-robot waits caused purely by other robots:
+        # robot_id -> {"blocked_by": [robot_id, ...], "ticks": int}.
+        self._traffic_waits: dict[str, dict[str, object]] = {}
         positions = [robot.position for robot in robots]
         if len(positions) != len(set(positions)):
             raise ValueError("robots cannot share an initial position")
@@ -210,20 +234,27 @@ class FleetSimulator:
             "removed": [list(cell) for cell in removed],
         }
 
-    def _plan_route(self, robot: Robot, task: Task) -> list[Position] | None:
-        """Shortest current->pickup->dropoff route, or None if unreachable."""
+    def _plan_route(
+        self, robot: Robot, task: Task, start: Position | None = None
+    ) -> list[Position] | None:
+        """Shortest current->pickup->dropoff route, or None if unreachable.
+
+        *start* overrides the robot's current position, which is how sidestep
+        candidates are evaluated without moving the robot first.
+        """
+        origin = robot.position if start is None else start
         try:
             if not task.picked_up:
-                if robot.position == task.pickup:
+                if origin == task.pickup:
                     to_pickup: list[Position] = []
                 else:
-                    to_pickup = shortest_path(self.grid, robot.position, task.pickup)
+                    to_pickup = shortest_path(self.grid, origin, task.pickup)
                 to_dropoff = shortest_path(self.grid, task.pickup, task.dropoff)
             else:
                 # Goods are already on board: a reclosed pickup cell must not
                 # pull the robot back.
                 to_pickup = []
-                to_dropoff = shortest_path(self.grid, robot.position, task.dropoff)
+                to_dropoff = shortest_path(self.grid, origin, task.dropoff)
         except ValueError:
             return None
         return to_pickup + to_dropoff
@@ -263,6 +294,96 @@ class FleetSimulator:
             robot.route = route
             self.paused_tasks.discard(task_id)
             self._finish_if_arrived(robot)
+
+    # ------------------------------------------------------------------
+    # Traffic conflicts and yielding
+    # ------------------------------------------------------------------
+
+    def _route_cells(self, exclude_id: str) -> set[Position]:
+        """Cells every robot except *exclude_id* still plans to drive through."""
+        cells: set[Position] = set()
+        for robot in self.robots.values():
+            if robot.robot_id != exclude_id:
+                cells.update(robot.route)
+        return cells
+
+    def _idle_sidestep_cell(
+        self,
+        blocker: Robot,
+        requester: Robot,
+        occupied: dict[Position, str],
+        reserved: dict[Position, str],
+    ) -> Position | None:
+        """Free side-cell an idle blocker can yield to, or None.
+
+        The target may not be the requester's own cell (that would swap the
+        two robots within one tick) nor any cell another robot still plans to
+        drive through, so the blocker never trades one blockage for another.
+        """
+        on_routes = self._route_cells(exclude_id=blocker.robot_id)
+        for cell in self.grid.neighbors(blocker.position):
+            if cell == requester.position:
+                continue
+            if cell in occupied or cell in reserved:
+                continue
+            if cell in on_routes:
+                continue
+            return cell
+        return None
+
+    def _self_sidestep(
+        self,
+        robot: Robot,
+        task: Task | None,
+        occupied: dict[Position, str],
+        reserved: dict[Position, str],
+    ) -> tuple[Position, list[Position]] | None:
+        """Best side cell plus replanned route for a blocked robot, or None.
+
+        Only cells off every other robot's planned route qualify, and only if
+        the task remains reachable from there; stepping backwards along the
+        corridor is never useful and would just oscillate. Candidates are
+        ranked by replanned route length with the deterministic neighbor order
+        (up, left, right, down) breaking ties.
+        """
+        if task is None or task.completed:
+            return None
+        on_routes = self._route_cells(exclude_id=robot.robot_id)
+        best: tuple[int, int, Position, list[Position]] | None = None
+        for index, cell in enumerate(self.grid.neighbors(robot.position)):
+            if cell in occupied or cell in reserved or cell in on_routes:
+                continue
+            route = self._plan_route(robot, task, start=cell)
+            if route is None:
+                continue
+            if best is None or (len(route), index) < (best[0], best[1]):
+                best = (len(route), index, cell, route)
+        if best is None:
+            return None
+        return best[2], best[3]
+
+    def _update_traffic_waits(self, blocked_by: dict[str, str]) -> None:
+        """Accumulate consecutive waits; any other outcome resets the counter."""
+        for robot_id in list(self._traffic_waits):
+            if robot_id not in blocked_by:
+                del self._traffic_waits[robot_id]
+        for robot_id, blocker_id in blocked_by.items():
+            entry = self._traffic_waits.get(robot_id)
+            if entry is None:
+                self._traffic_waits[robot_id] = {"blocked_by": [blocker_id], "ticks": 1}
+            else:
+                entry["blocked_by"] = [blocker_id]
+                entry["ticks"] = int(entry["ticks"]) + 1
+
+    def _traffic_wait_report(self) -> list[dict[str, object]]:
+        return [
+            {
+                "robot_id": robot_id,
+                "blocked_by": list(entry["blocked_by"]),
+                "ticks": entry["ticks"],
+            }
+            for robot_id, entry in sorted(self._traffic_waits.items())
+        ]
 
     # ------------------------------------------------------------------
     # Normal execution
@@ -305,12 +426,31 @@ class FleetSimulator:
         self._confirm_pickups()
         self._recover_paused_tasks()
         self.assign_tasks()
-        occupied = {robot.position for robot in self.robots.values()}
-        reserved: set[tuple[int, int]] = set()
+        # A robot assigned while already standing on the pickup cell collects
+        # immediately instead of driving off without the goods.
+        self._confirm_pickups()
+        occupied = {robot.position: robot.robot_id for robot in self.robots.values()}
+        reserved: dict[tuple[int, int], str] = {}
         moved: list[str] = []
+        moved_ids: set[str] = set()
+        blocked_by: dict[str, str] = {}
+
+        def relocate(robot: Robot, destination: tuple[int, int]) -> None:
+            del occupied[robot.position]
+            robot.position = destination
+            robot.distance_travelled += 1
+            occupied[destination] = robot.robot_id
+            reserved[destination] = robot.robot_id
+            moved.append(robot.robot_id)
+            moved_ids.add(robot.robot_id)
+
         for robot in sorted(self.robots.values(), key=lambda item: item.robot_id):
+            if robot.robot_id in moved_ids:
+                # Already yielded this tick at another robot's request.
+                continue
             task = self.tasks[robot.task_id] if robot.task_id is not None else None
             if task is not None and task.task_id in self.paused_tasks:
+                # Paused by map unreachability: stays put, never yields.
                 continue
             if not robot.route:
                 self._finish_if_arrived(robot)
@@ -326,18 +466,50 @@ class FleetSimulator:
                     else:
                         robot.route = route
                 continue
-            if destination in reserved or (destination in occupied and destination != robot.position):
-                # Another robot is in the way; the task stays active and this
-                # is distinct from a map-unreachability pause.
+            blocker_id = occupied.get(destination)
+            if blocker_id is None:
+                blocker_id = reserved.get(destination)
+            if blocker_id is None or blocker_id == robot.robot_id:
+                relocate(robot, destination)
+                robot.route.pop(0)
+                self._finish_if_arrived(robot)
                 continue
-            occupied.remove(robot.position)
-            robot.position = destination
-            robot.route.pop(0)
-            robot.distance_travelled += 1
-            occupied.add(destination)
-            reserved.add(destination)
-            moved.append(robot.robot_id)
-            self._finish_if_arrived(robot)
+            # Another robot is in the way; this is distinct from a
+            # map-unreachability pause and the task stays active.
+            blocker = self.robots[blocker_id]
+            if blocker_id not in moved_ids:
+                if blocker.task_id is None:
+                    # Idle blocker: ask it to yield onto a free side cell,
+                    # then take over the cell it vacated.
+                    side = self._idle_sidestep_cell(blocker, robot, occupied, reserved)
+                    if side is not None:
+                        relocate(blocker, side)
+                        relocate(robot, destination)
+                        robot.route.pop(0)
+                        self._finish_if_arrived(robot)
+                        continue
+                elif blocker.route:
+                    ahead = blocker.route[0]
+                    if (
+                        self.grid.traversable(ahead)
+                        and ahead not in occupied
+                        and ahead not in reserved
+                    ):
+                        # The blocker is expected to drive on within this
+                        # tick, so waiting one tick is cheaper than detouring.
+                        blocked_by[robot.robot_id] = blocker_id
+                        continue
+            # The blocker cannot or will not move this tick: try to sidestep
+            # onto a free adjacent cell and replan from there.
+            side = self._self_sidestep(robot, task, occupied, reserved)
+            if side is not None:
+                cell, route = side
+                relocate(robot, cell)
+                robot.route = route
+                self._finish_if_arrived(robot)
+                continue
+            blocked_by[robot.robot_id] = blocker_id
+        self._update_traffic_waits(blocked_by)
         self.tick += 1
         event: dict[str, object] = {
             "type": "tick",
@@ -371,16 +543,18 @@ class FleetSimulator:
             "tasks_paused": sorted(self.paused_tasks),
             "completion_ratio": completed / len(self.tasks) if self.tasks else 1.0,
             "distance_total": sum(robot.distance_travelled for robot in self.robots.values()),
+            "traffic_waits": self._traffic_wait_report(),
         }
 
     def status(self) -> dict[str, object]:
-        """Current obstacles and tasks suspended due to map unreachability."""
+        """Obstacles, map-unreachability pauses and per-robot traffic waits."""
         return {
             "tick": self.tick,
             "width": self.grid.width,
             "height": self.grid.height,
             "obstacles": [list(cell) for cell in sorted(self.grid.obstacles)],
             "paused_tasks": sorted(self.paused_tasks),
+            "traffic_waits": self._traffic_wait_report(),
         }
 
     def map_change_history(self) -> list[dict[str, object]]:
@@ -445,6 +619,7 @@ class FleetSimulator:
             "replay": copy.deepcopy(self.replay),
             "map_changes": copy.deepcopy(self.map_changes),
             "paused_tasks": sorted(self.paused_tasks),
+            "traffic_waits": self._traffic_wait_report(),
         }
         payload = (json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
 
@@ -626,6 +801,7 @@ class FleetSimulator:
                     )
 
         cls._validate_paused_state(paused, task_by_id, robot_by_id, grid)
+        traffic_waits = cls._load_traffic_waits(data, robot_by_id)
 
         replay_change_frames = cls._replay_map_change_frames(replay)
         if replay_change_frames != map_changes:
@@ -638,6 +814,7 @@ class FleetSimulator:
         simulator.map_changes = copy.deepcopy(map_changes)
         simulator._map_sequence = len(map_changes)
         simulator.paused_tasks = set(paused)
+        simulator._traffic_waits = traffic_waits
         cls._validate_replay_positions(replay, tick, robot_by_id)
         return simulator
 
@@ -903,6 +1080,55 @@ class FleetSimulator:
         if len(raw) != len(set(raw)):
             raise ValueError("checkpoint field 'paused_tasks' contains duplicates")
         return set(raw)
+
+    @classmethod
+    def _load_traffic_waits(
+        cls, data: Mapping[str, object], robot_by_id: Mapping[str, Robot]
+    ) -> dict[str, dict[str, object]]:
+        # Optional in every format version; older files simply lack the field
+        # and their robots start with zero recorded waits.
+        raw = data.get("traffic_waits", [])
+        if not isinstance(raw, list):
+            raise ValueError("checkpoint field 'traffic_waits' must be a list")
+        waits: dict[str, dict[str, object]] = {}
+        for index, entry in enumerate(raw):
+            context = f"traffic wait entry {index}"
+            if not isinstance(entry, dict):
+                raise ValueError(f"{context} must be an object")
+            robot_id = entry.get("robot_id")
+            if not isinstance(robot_id, str):
+                raise ValueError(f"{context} field 'robot_id' must be a string")
+            if robot_id not in robot_by_id:
+                raise ValueError(f"{context} refers to unknown robot {robot_id!r}")
+            if robot_id in waits:
+                raise ValueError(f"duplicate traffic wait entry for robot {robot_id!r}")
+            blocked_by = entry.get("blocked_by")
+            if (
+                not isinstance(blocked_by, list)
+                or not blocked_by
+                or not all(isinstance(value, str) for value in blocked_by)
+            ):
+                raise ValueError(
+                    f"{context} field 'blocked_by' must be a non-empty list of strings"
+                )
+            if len(blocked_by) != len(set(blocked_by)):
+                raise ValueError(f"{context} field 'blocked_by' contains duplicates")
+            for blocker_id in blocked_by:
+                if blocker_id == robot_id:
+                    raise ValueError(f"{context} robot {robot_id!r} cannot block itself")
+                if blocker_id not in robot_by_id:
+                    raise ValueError(
+                        f"{context} refers to unknown blocking robot {blocker_id!r}"
+                    )
+            ticks = entry.get("ticks")
+            if not _is_int(ticks) or ticks <= 0:
+                raise ValueError(f"{context} field 'ticks' must be a positive integer")
+            if not robot_by_id[robot_id].route:
+                raise ValueError(
+                    f"{context} robot {robot_id!r} has no remaining route to wait on"
+                )
+            waits[robot_id] = {"blocked_by": list(blocked_by), "ticks": ticks}
+        return waits
 
     @staticmethod
     def _validate_paused_state(

@@ -56,7 +56,7 @@ robots never enter a new obstacle.
 Queries and history:
 
 ```python
-simulator.status()              # current obstacles + paused task ids
+simulator.status()              # current obstacles + paused task ids + traffic waits
 simulator.map_change_history()  # effective tick, adds/removes, order
 ```
 
@@ -69,6 +69,39 @@ added/removed cells; ordinary tick frames keep their original positions and
 completion data and are never rewritten by later maps. Identical initial state
 with an identical sequence of steps and edits always produces identical
 routes, replay and statistics.
+
+## Automatic yielding in traffic
+
+When a robot's next waypoint is occupied by another robot, `step()` no longer
+just waits: an idle blocker is asked to step onto a free neighbouring cell
+that lies on no robot's planned route, and a busy robot whose blocker cannot
+drive on may sidestep onto a free adjacent cell itself and replan its
+(still shortest) route from there. Every robot still moves at most one
+orthogonal cell per tick (or waits), robots never share a cell at the end of
+a tick, never swap places within one tick, and never enter an obstacle.
+
+Yielding moves count as mileage; waiting does not. The task keeps its
+original robot and the pickup rules are unchanged — goods are collected
+before delivery, a loaded robot never returns to the pickup cell, and nothing
+completes early because of a detour. Robots paused by map unreachability stay
+put and never take part in yielding. An idle robot that yields is not hired
+by doing so: it stays on its side cell once the way is clear and can still
+pick up tasks later. If no safe side cell exists, both robots simply wait —
+time advances, cargo and tasks are kept, and nothing collides or completes.
+
+Traffic waits are reported separately from map pauses:
+
+```python
+simulator.status()["traffic_waits"]
+# [{"robot_id": "R-01", "blocked_by": ["R-02"], "ticks": 3}, ...]
+```
+
+A robot's counter only grows while another robot blocks its next waypoint and
+it does not move; any move or the blockage clearing resets it to zero. The
+same report appears in `metrics()` (and therefore in the command-line
+output), and it is saved into and restored from checkpoints — older
+checkpoint files without it load with every counter at zero.
+
 
 ## Saving and resuming progress
 
@@ -123,6 +156,10 @@ Checkpoints are UTF-8 encoded JSON. The top-level object contains:
   `assigned_robot`; unassigned tasks use `null`.
 - `paused_tasks` — ids of tasks whose assigned robot currently cannot reach a
   required point on the saved map.
+- `traffic_waits` — optional list of `{"robot_id", "blocked_by", "ticks"}`
+  entries: robots currently held up by other robots, who blocks them, and for
+  how many consecutive ticks. Older files without this field load with every
+  counter at zero.
 - `map_changes` — every actual edit in order, each
   `{"tick", "sequence", "added", "removed"}`; `sequence` runs from 1 and
   consecutive edits at the same `tick` preserve their order.
