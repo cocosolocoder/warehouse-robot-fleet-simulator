@@ -77,8 +77,22 @@ Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
 mismatches, broken replay or map-change history, and a history that does not
-reproduce the saved grid all raise :class:`ValueError`. Filesystem and
-permission failures propagate as :class:`OSError`.
+reproduce the saved grid all raise :class:`ValueError`.
+
+The recorded movement history is checked for physical plausibility, not just
+for a matching final frame. In every tick frame each robot must stand on a
+cell that is in bounds and traversable on the map of that moment, no two
+robots may end a tick on the same cell, and from the second frame on a robot
+may only have waited or stepped one orthogonal cell (two robots cannot swap
+cells within one tick; following a robot into the cell it just vacated is
+fine). A frame's ``moved`` list must reference current fleet robots without
+duplicates and, whenever a previous frame exists, must name exactly the
+robots whose positions changed, in any order. Version 2 map changes are
+applied in their recorded order after the tick they are stamped on, so a
+robot may be recorded in a cell that is closed later, may not appear in a
+cell before it opens, and no change may add an obstacle onto a cell a tick
+frame shows occupied -- not even when a later change of the same tick removes
+it. Filesystem and permission failures propagate as :class:`OSError`.
 """
 
 from __future__ import annotations
@@ -815,7 +829,11 @@ class FleetSimulator:
         simulator._map_sequence = len(map_changes)
         simulator.paused_tasks = set(paused)
         simulator._traffic_waits = traffic_waits
-        cls._validate_replay_positions(replay, tick, robot_by_id)
+        # Version 1 has no edit history: its saved grid is the baseline and
+        # applies to every tick frame. Version 2 replays the recorded changes
+        # alongside the frames so each frame is judged against its contemporary
+        # map.
+        cls._validate_replay_positions(replay, tick, robot_by_id, base_grid, map_changes)
         return simulator
 
     @staticmethod
@@ -1281,31 +1299,199 @@ class FleetSimulator:
             replay.append(normalized)
         return replay
 
-    @staticmethod
+    @classmethod
     def _validate_replay_positions(
+        cls,
         replay: Sequence[Mapping[str, object]],
         tick: int,
         robot_by_id: Mapping[str, Robot],
+        base_grid: GridMap,
+        changes: Sequence[Mapping[str, object]] = (),
     ) -> None:
+        """Reject history that the simulator could never have produced.
+
+        Every tick frame is checked against the map in effect *during* that
+        tick: positions must be in bounds and traversable, no two robots may
+        share a cell, each robot may only wait or step one orthogonal cell
+        between consecutive tick frames, two robots may not swap cells within
+        one tick, and ``moved`` must list exactly the robots whose positions
+        changed.
+
+        Version 2 map changes take effect after the tick they are stamped on,
+        in their recorded order: the frame for tick *t* is judged against the
+        base grid plus every change stamped below *t*, then the changes stamped
+        *t* are applied and may not add obstacles onto cells frame *t* shows a
+        robot on -- even when a later change of the same tick removes the cell
+        again. Tick-0 changes precede the first frame. Adjacency is always
+        judged between neighboring tick frames; a map change between them never
+        moves a robot.
+
+        Version 1 files pass no changes, so the saved grid governs every frame.
+        The first frame has no recorded predecessor: its cells, overlaps and
+        ``moved`` ids are still checked, but neither the distance of the first
+        moves nor the first ``moved`` list is second-guessed.
+        """
         tick_frames = [frame for frame in replay if frame.get("type") == "tick"]
         if len(tick_frames) != tick:
             raise ValueError(
                 f"replay has {len(tick_frames)} tick frames but the checkpoint is at tick {tick}"
             )
+
         expected_ids = set(robot_by_id)
-        for frame in tick_frames:
-            frame_positions = frame["robots"]
-            assert isinstance(frame_positions, dict)
-            if set(frame_positions) != expected_ids:
+
+        def frame_positions(frame: Mapping[str, object]) -> dict[str, tuple[int, int]]:
+            raw = frame["robots"]
+            assert isinstance(raw, dict)
+            if set(raw) != expected_ids:
                 raise ValueError(
                     f"replay frame {frame['tick']} robot ids do not match current robots"
                 )
+            return {robot_id: tuple(position) for robot_id, position in raw.items()}
+
+        # A non-zero-tick history must end exactly where the saved robots stand
+        # before any deeper history check runs.
         if tick > 0:
-            last = tick_frames[-1]
-            assert isinstance(last["robots"], dict)
-            for robot_id, position in last["robots"].items():
-                if tuple(position) != robot_by_id[robot_id].position:
+            last_positions = frame_positions(tick_frames[-1])
+            for robot_id, position in last_positions.items():
+                if position != robot_by_id[robot_id].position:
                     raise ValueError(
                         "last replay frame positions do not match current robot positions "
                         f"for robot {robot_id!r}"
                     )
+
+        obstacles = set(base_grid.obstacles)
+        width, height = base_grid.width, base_grid.height
+        change_index = 0
+
+        def apply_changes(stamp: int, occupants: Mapping[Position, str]) -> None:
+            """Apply every change stamped *stamp*, rejecting adds on robots.
+
+            *occupants* maps a cell to the robot sitting on it when that tick
+            ended; it is empty for tick-0 edits once ticks have already run,
+            because the unrecorded initial layout cannot be reconstructed.
+            """
+            nonlocal change_index
+            while change_index < len(changes) and changes[change_index]["tick"] == stamp:
+                change = changes[change_index]
+                sequence = change["sequence"]
+                added = {tuple(cell) for cell in change["added"]}
+                for cell in added:
+                    robot_id = occupants.get(cell)
+                    if robot_id is not None:
+                        when = (
+                            "the initial layout before tick 1"
+                            if stamp == 0
+                            else f"tick frame {stamp}"
+                        )
+                        raise ValueError(
+                            f"map change {sequence} (after tick {stamp}) adds obstacle "
+                            f"{list(cell)} occupied by robot {robot_id!r} in {when}"
+                        )
+                obstacles.update(added)
+                obstacles.difference_update(
+                    {tuple(cell) for cell in change["removed"]}
+                )
+                change_index += 1
+
+        # Tick-0 edits happened before the first recorded frame. When the
+        # checkpoint is still at tick 0 the saved robot positions *are* the
+        # layout of that moment; otherwise they cannot be reconstructed.
+        initial_occupants = (
+            {robot.position: robot.robot_id for robot in robot_by_id.values()}
+            if tick == 0
+            else {}
+        )
+        apply_changes(0, initial_occupants)
+
+        previous: dict[str, tuple[int, int]] | None = None
+        for frame in tick_frames:
+            frame_tick = frame["tick"]
+            # The grid here still reflects only changes stamped below this
+            # tick -- exactly the map the robots moved on during this tick.
+            positions = frame_positions(frame)
+            grid = GridMap(width, height, frozenset(obstacles))
+
+            for robot_id, position in positions.items():
+                if not grid.contains(position):
+                    raise ValueError(
+                        f"replay frame {frame_tick} robot {robot_id!r} is at "
+                        f"{list(position)}, outside the map in effect at tick {frame_tick}"
+                    )
+                if position in grid.obstacles:
+                    raise ValueError(
+                        f"replay frame {frame_tick} robot {robot_id!r} is at "
+                        f"{list(position)}, an obstacle on the map in effect at tick "
+                        f"{frame_tick}"
+                    )
+
+            cells_seen: dict[Position, str] = {}
+            for robot_id, position in positions.items():
+                occupant = cells_seen.get(position)
+                if occupant is not None:
+                    raise ValueError(
+                        f"replay frame {frame_tick} robots {occupant!r} and {robot_id!r} "
+                        f"both occupy cell {list(position)}"
+                    )
+                cells_seen[position] = robot_id
+
+            moved = frame["moved"]
+            assert isinstance(moved, list)
+            moved_ids: set[str] = set()
+            for robot_id in moved:
+                if robot_id not in expected_ids:
+                    raise ValueError(
+                        f"replay frame {frame_tick} 'moved' lists unknown robot "
+                        f"{robot_id!r}"
+                    )
+                if robot_id in moved_ids:
+                    raise ValueError(
+                        f"replay frame {frame_tick} 'moved' lists robot {robot_id!r} "
+                        "more than once"
+                    )
+                moved_ids.add(robot_id)
+
+            if previous is not None:
+                actually_moved: set[str] = set()
+                for robot_id, position in positions.items():
+                    old = previous[robot_id]
+                    distance = abs(position[0] - old[0]) + abs(position[1] - old[1])
+                    if distance > 1:
+                        raise ValueError(
+                            f"replay frame {frame_tick} robot {robot_id!r} moves more "
+                            f"than one cell, from {list(old)} to {list(position)}"
+                        )
+                    if distance == 1:
+                        actually_moved.add(robot_id)
+                mover_ids = sorted(actually_moved)
+                for index, robot_id in enumerate(mover_ids):
+                    for other_id in mover_ids[index + 1 :]:
+                        if (
+                            positions[robot_id] == previous[other_id]
+                            and positions[other_id] == previous[robot_id]
+                        ):
+                            raise ValueError(
+                                f"replay frame {frame_tick} robots {robot_id!r} and "
+                                f"{other_id!r} swap cells "
+                                f"{list(previous[robot_id])} and {list(positions[robot_id])} "
+                                "within one tick"
+                            )
+                # Following another robot into the cell it just vacated is
+                # legal: only a true two-way swap is rejected above, and the
+                # recorded list need not be sorted by robot id.
+                if moved_ids != actually_moved:
+                    missing = sorted(actually_moved - moved_ids)
+                    extra = sorted(moved_ids - actually_moved)
+                    details = []
+                    if missing:
+                        details.append(f"movers missing from the list: {missing}")
+                    if extra:
+                        details.append(f"robots listed without moving: {extra}")
+                    raise ValueError(
+                        f"replay frame {frame_tick} 'moved' does not match the robots "
+                        f"that changed position ({'; '.join(details)})"
+                    )
+
+            # The tick has ended: its own map changes now take effect on top of
+            # the cells the frame records the robots on.
+            apply_changes(frame_tick, cells_seen)
+            previous = positions

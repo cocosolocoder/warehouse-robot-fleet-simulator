@@ -177,8 +177,22 @@ or out-of-bounds/blocked robot positions, routes that leave the map, cross
 obstacles, or make non-adjacent moves, task/robot ownership mismatches, a
 broken replay history, out-of-bounds or add/remove-conflicting change records,
 a change history that does not reproduce the saved grid, and an inconsistent
-paused-task state are all rejected. Version 1 documents contain tick frames
-without a `type` field and none of the edit-related keys; they load as if no
-map edit had ever happened.
+paused-task state are all rejected. So is a replay whose *history* could never
+have happened, even when its final frame matches the saved robots: a robot out
+of bounds or on an obstacle that existed at that tick, two robots sharing a
+cell at a tick boundary, a jump of more than one orthogonal cell or a two-robot
+cell swap between neighboring tick frames, and a `moved` list that names an
+unknown/duplicated robot or does not exactly match the robots that changed
+position (following another robot into the cell it just vacated is legal, and
+the list need not be sorted). Map edits are judged against contemporary
+positions: a cell a robot once passed through may be closed later without
+invalidating the replay, a robot may not appear in a cell before it opens, and
+an edit may not add an obstacle onto a cell occupied when that tick ended —
+not even if another edit of the same tick removes it again. The first tick
+frame has no recorded predecessor, so its cells, overlaps and `moved` ids are
+still checked but the first moves are not second-guessed; zero-tick files,
+empty fleets and all-waiting frames remain valid. Version 1 documents contain
+tick frames without a `type` field and none of the edit-related keys; they
+load as if no map edit had ever happened.
 
 
