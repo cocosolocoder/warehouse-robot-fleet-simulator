@@ -815,7 +815,9 @@ class FleetSimulator:
         simulator._map_sequence = len(map_changes)
         simulator.paused_tasks = set(paused)
         simulator._traffic_waits = traffic_waits
-        cls._validate_replay_positions(replay, tick, robot_by_id)
+        cls._validate_replay_positions(
+            replay, tick, robot_by_id, base_grid, version == 2
+        )
         return simulator
 
     @staticmethod
@@ -1286,6 +1288,8 @@ class FleetSimulator:
         replay: Sequence[Mapping[str, object]],
         tick: int,
         robot_by_id: Mapping[str, Robot],
+        base_grid: GridMap,
+        has_map_changes: bool,
     ) -> None:
         tick_frames = [frame for frame in replay if frame.get("type") == "tick"]
         if len(tick_frames) != tick:
@@ -1309,3 +1313,156 @@ class FleetSimulator:
                         "last replay frame positions do not match current robot positions "
                         f"for robot {robot_id!r}"
                     )
+
+        # The final frame matching the saved state is not enough: every frame
+        # must describe a move that could really have happened on the map in
+        # effect at the time, otherwise the replay is corrupted and must not be
+        # carried into the resumed simulation.
+        FleetSimulator._validate_replay_map_correspondence(
+            replay, tick_frames, robot_by_id, base_grid, has_map_changes, tick
+        )
+        FleetSimulator._validate_replay_movement(tick_frames, robot_by_id)
+
+    @staticmethod
+    def _validate_replay_map_correspondence(
+        replay: Sequence[Mapping[str, object]],
+        tick_frames: Sequence[Mapping[str, object]],
+        robot_by_id: Mapping[str, Robot],
+        base_grid: GridMap,
+        has_map_changes: bool,
+        tick: int,
+    ) -> None:
+        """Check frame positions against the map in effect at each tick.
+
+        Map changes take effect after the tick they are stamped with: a change
+        at tick *k* is in effect for tick frame *k+1* onwards, while tick frame
+        *k* was recorded before it. Walking the replay in order keeps the map
+        state aligned with the frame being checked, and a change that closes a
+        cell a robot still occupies in its own tick frame is rejected even if a
+        later change in the same batch reopens the cell.
+        """
+        frame_by_tick = {frame["tick"]: frame for frame in tick_frames}
+        obstacles = set(base_grid.obstacles)
+        for frame in replay:
+            frame_type = frame.get("type", "tick")
+            if frame_type == "map_change":
+                if not has_map_changes:
+                    raise ValueError("version 1 checkpoints cannot contain map change frames")
+                change_tick = frame["tick"]
+                for cell in frame["added"]:
+                    obstacles.add(tuple(cell))
+                for cell in frame["removed"]:
+                    obstacles.discard(tuple(cell))
+                # A change may not close a cell a robot occupies at the moment
+                # it takes effect. For tick k >= 1 that is tick frame k; for
+                # tick 0 the robots stand at their saved positions (no frame 0
+                # is recorded). When the checkpoint has tick frames, tick-0
+                # changes predate the first recorded positions, so only the
+                # frame traversability check below can judge them.
+                if change_tick >= 1:
+                    occupied_frame = frame_by_tick.get(change_tick)
+                    if occupied_frame is not None:
+                        for robot_id, raw_position in occupied_frame["robots"].items():
+                            position = tuple(raw_position)
+                            if position in obstacles:
+                                raise ValueError(
+                                    f"map change {frame['sequence']} at tick {change_tick} "
+                                    f"closes cell {list(position)} occupied by robot "
+                                    f"{robot_id!r} in tick frame {change_tick}"
+                                )
+                elif tick == 0:
+                    for robot_id, robot in robot_by_id.items():
+                        if robot.position in obstacles:
+                            raise ValueError(
+                                f"map change {frame['sequence']} at tick 0 closes cell "
+                                f"{list(robot.position)} occupied by robot {robot_id!r}"
+                            )
+                continue
+            # Tick frame: changes stamped with this tick appear after it, so
+            # the map state here only contains changes from earlier ticks.
+            occupant: dict[tuple[int, int], str] = {}
+            for robot_id, raw_position in frame["robots"].items():
+                position = tuple(raw_position)
+                if not base_grid.contains(position) or position in obstacles:
+                    raise ValueError(
+                        f"replay frame {frame['tick']} robot {robot_id!r} position "
+                        f"{list(position)} is not traversable on the map in effect at "
+                        "that tick"
+                    )
+                if position in occupant:
+                    raise ValueError(
+                        f"replay frame {frame['tick']} robots {occupant[position]!r} and "
+                        f"{robot_id!r} share position {list(position)} at frame end"
+                    )
+                occupant[position] = robot_id
+
+    @staticmethod
+    def _validate_replay_movement(
+        tick_frames: Sequence[Mapping[str, object]],
+        robot_by_id: Mapping[str, Robot],
+    ) -> None:
+        """Check each tick-to-tick move against the recorded positions.
+
+        From the second tick frame on, a robot may only wait in place or move
+        one orthogonal cell; two robots may not swap cells within one tick; and
+        ``moved`` must list exactly the robots whose positions changed. The
+        first frame has no recorded predecessor, so only its cell, overlap and
+        moved-list validity are checked.
+        """
+        if not tick_frames:
+            return
+        robot_ids = sorted(robot_by_id)
+        previous: dict[str, tuple[int, int]] | None = None
+        for frame in tick_frames:
+            tick_index = frame["tick"]
+            positions = {
+                robot_id: tuple(raw_position)
+                for robot_id, raw_position in frame["robots"].items()
+            }
+            moved = frame["moved"]
+            moved_set: set[str] = set()
+            for robot_id in moved:
+                if robot_id not in robot_ids:
+                    raise ValueError(
+                        f"replay frame {tick_index} 'moved' lists unknown robot {robot_id!r}"
+                    )
+                if robot_id in moved_set:
+                    raise ValueError(
+                        f"replay frame {tick_index} 'moved' lists robot {robot_id!r} "
+                        "more than once"
+                    )
+                moved_set.add(robot_id)
+            if previous is None:
+                previous = positions
+                continue
+            for robot_id in robot_ids:
+                prev = previous[robot_id]
+                curr = positions[robot_id]
+                if prev == curr:
+                    continue
+                distance = abs(curr[0] - prev[0]) + abs(curr[1] - prev[1])
+                if distance != 1:
+                    raise ValueError(
+                        f"robot {robot_id!r} jumps from {list(prev)} to {list(curr)} "
+                        f"between tick frames {tick_index - 1} and {tick_index}"
+                    )
+                for other_id in robot_ids:
+                    if other_id == robot_id:
+                        continue
+                    if previous[other_id] == curr and positions[other_id] == prev:
+                        raise ValueError(
+                            f"robots {robot_id!r} and {other_id!r} swap positions "
+                            f"{list(prev)} and {list(curr)} between tick frames "
+                            f"{tick_index - 1} and {tick_index}"
+                        )
+            changed = {
+                robot_id
+                for robot_id in robot_ids
+                if previous[robot_id] != positions[robot_id]
+            }
+            if changed != moved_set:
+                raise ValueError(
+                    f"replay frame {tick_index} 'moved' does not match the robots whose "
+                    "positions changed"
+                )
+            previous = positions
