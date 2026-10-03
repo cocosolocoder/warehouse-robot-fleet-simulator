@@ -27,7 +27,11 @@ purely by other robots is tracked per robot (consecutive ticks and the
 blocking robot) and reported by :meth:`FleetSimulator.status` and
 :meth:`FleetSimulator.metrics` as ``traffic_waits``, distinct from the
 map-unreachability ``paused_tasks``; the counter clears the moment the robot
-moves again or the blockage ends.
+moves again or the blockage ends. An accepted map edit reconciles the record
+right away -- without a tick, a move, or any new entry: pausing a task drops
+its wait, a replanned next cell no longer held by the recorded blocking robot
+drops the stale entry, and an unchanged blockage keeps the count exactly as it
+was. Closing and later reopening a road never restores a dropped count.
 
 Checkpoint file format
 ----------------------
@@ -188,7 +192,11 @@ class FleetSimulator:
         Assigned unfinished tasks keep their robot: routes are replanned
         against the new map, or, when a required point is unreachable, cleared
         while the task is suspended. No tick is recorded, no robot moves and no
-        distance is accumulated.
+        distance is accumulated. Traffic-wait records are reconciled with the
+        post-edit layout: entries for paused or routeless robots and entries
+        whose replanned next cell is no longer held by the recorded blocking
+        robot are deleted, entries facing the same blocker keep their count,
+        and no entry is created or incremented.
         """
         add_cells = self._normalize_cells(added, "added")
         remove_cells = self._normalize_cells(removed, "removed")
@@ -295,6 +303,38 @@ class FleetSimulator:
                 # confirmed at step start (or were already recorded).
                 robot.route = route
                 self.paused_tasks.discard(task.task_id)
+        self._reconcile_traffic_waits_after_map_change()
+
+    def _reconcile_traffic_waits_after_map_change(self) -> None:
+        """Bring traffic-wait records in line with the post-edit layout.
+
+        A map edit never moves a robot and never creates waits, so existing
+        entries are only kept or dropped, never incremented or reset to a
+        different count. An entry is dropped when its robot's task became
+        unreachable (a paused robot cannot be traffic-waiting), when no route
+        remains, or when the replanned next cell is no longer held by the robot
+        named in the old record -- the old blockage is over, even though the
+        robot neither moved nor completed a task during the edit. An entry
+        whose robot still faces the very same blocking robot keeps its count.
+        """
+        occupants = {robot.position: robot.robot_id for robot in self.robots.values()}
+        for robot_id in list(self._traffic_waits):
+            robot = self.robots.get(robot_id)
+            entry = self._traffic_waits[robot_id]
+            if robot is None or robot.task_id is None:
+                del self._traffic_waits[robot_id]
+                continue
+            task = self.tasks.get(robot.task_id)
+            if (
+                task is None
+                or task.completed
+                or task.task_id in self.paused_tasks
+                or not robot.route
+            ):
+                del self._traffic_waits[robot_id]
+                continue
+            if occupants.get(robot.route[0]) not in entry["blocked_by"]:
+                del self._traffic_waits[robot_id]
 
     def _recover_paused_tasks(self) -> None:
         """Resume tasks suspended by map unreachability where possible."""

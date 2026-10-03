@@ -53,6 +53,21 @@ block other tasks. The next `step()` after cells reopen automatically resumes
 paused driving and assigns waiting tasks; collision avoidance still applies and
 robots never enter a new obstacle.
 
+The same edit also reconciles the traffic-wait record immediately, without
+waiting for a tick: a robot paused by unreachability no longer appears as
+traffic-waiting (its task ownership, cargo and position are otherwise kept),
+and if the replanned next cell is no longer occupied by the robot named in the
+old record that entry is deleted — the old blockage is over, even though the
+edit moved no robot and completed no task. An entry whose robot still faces the
+same blocking robot keeps its accumulated count; editing unrelated cells
+neither clears nor grows it. An edit never creates a wait entry, never
+increments one, and never advances the clock; a brand-new blockage is first
+recorded on the tick the robot actually waits. Reopening a road does not
+restore a count removed when the task was paused: if the robot is blocked
+again, the count starts from one, and ordinary driving still clears it.
+Rejected or otherwise ineffective edits leave the wait record, clock and
+history untouched.
+
 Queries and history:
 
 ```python

@@ -583,6 +583,171 @@ class TrafficWaitCheckpointTests(unittest.TestCase):
         )
 
 
+class MapEditTrafficWaitTests(unittest.TestCase):
+    """Traffic-wait records are reconciled immediately by modify_obstacles."""
+
+    def build_corridor_wait(self) -> FleetSimulator:
+        # 5x1 corridor: loaded A at (1,0), idle B parked at (2,0), goal (4,0).
+        # B has no side cell to yield onto, so A racks up consecutive waits.
+        sim = FleetSimulator(
+            GridMap(5, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0), (3, 0), (4, 0)], task_id="T"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T", (1, 0), (4, 0), assigned_robot="A", picked_up=True)],
+        )
+        for _ in range(3):
+            sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}],
+        )
+        return sim
+
+    def test_unreachable_edit_drops_wait_without_a_step(self) -> None:
+        sim = self.build_corridor_wait()
+        sim.modify_obstacles(added=[(3, 0)])
+        self.assertEqual(sim.status()["paused_tasks"], ["T"])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.metrics()["traffic_waits"], [])
+        # Ownership, cargo and position survive; only the route is cleared.
+        task = sim.tasks["T"]
+        self.assertEqual(task.assigned_robot, "A")
+        self.assertTrue(task.picked_up)
+        self.assertFalse(task.completed)
+        self.assertEqual(sim.robots["A"].task_id, "T")
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(sim.robots["A"].route, [])
+        self.assertEqual(sim.tick, 3)
+
+    def test_checkpoint_right_after_pausing_edit_loads(self) -> None:
+        sim = self.build_corridor_wait()
+        sim.modify_obstacles(added=[(3, 0)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            sim.save_checkpoint(path)
+            loaded = FleetSimulator.load_checkpoint(path)
+        self.assertEqual(loaded.status(), sim.status())
+        self.assertEqual(loaded.metrics(), sim.metrics())
+        self.assertEqual(loaded.paused_tasks, {"T"})
+
+    def test_replan_away_from_blocker_drops_old_wait_without_move(self) -> None:
+        # A at (2,1), idle B at (3,1), goal (4,0); row 0 is sealed except the
+        # goal, so the only route runs through B and A waits.
+        sim = FleetSimulator(
+            GridMap(5, 2, frozenset({(0, 0), (1, 0), (2, 0), (3, 0)})),
+            [
+                Robot("A", (2, 1), route=[(3, 1), (4, 1), (4, 0)], task_id="T"),
+                Robot("B", (3, 1)),
+            ],
+            [Task("T", (2, 1), (4, 0), assigned_robot="A", picked_up=True)],
+        )
+        sim.step()
+        sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+        # Block past B and open a bypass beside A: the replanned next cell is
+        # free, so the old blockage is over even though nobody moved.
+        sim.modify_obstacles(added=[(4, 1)], removed=[(2, 0), (3, 0)])
+        self.assertEqual(sim.status()["paused_tasks"], [])
+        self.assertEqual(sim.robots["A"].route, [(2, 0), (3, 0), (4, 0)])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.robots["A"].position, (2, 1))
+        self.assertFalse(sim.tasks["T"].completed)
+        self.assertEqual(sim.tick, 2)
+        # The fresh route actually executes.
+        for _ in range(6):
+            sim.step()
+            if sim.tasks["T"].completed:
+                break
+        self.assertTrue(sim.tasks["T"].completed)
+
+    def test_unrelated_edit_keeps_same_blocker_count_unchanged(self) -> None:
+        sim = self.build_corridor_wait()
+        sim.modify_obstacles(added=[(0, 0)])  # behind A, irrelevant
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}],
+        )
+        # A second edit with no actual effect must not grow the counter either.
+        sim.modify_obstacles(added=[])  # no-op batch
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}],
+        )
+
+    def test_edit_never_creates_new_waits(self) -> None:
+        # Free-moving robot becomes geometrically queued behind another by an
+        # edit? Map edits cannot move robots, so nothing may be newly recorded:
+        # the first wait only appears after a real waiting tick.
+        sim = FleetSimulator(
+            GridMap(5, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0), (3, 0), (4, 0)], task_id="T"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T", (1, 0), (4, 0), assigned_robot="A", picked_up=True)],
+        )
+        sim.modify_obstacles(added=[(0, 0)])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 1}],
+        )
+
+    def test_reopen_does_not_restore_old_count(self) -> None:
+        sim = self.build_corridor_wait()
+        sim.modify_obstacles(added=[(3, 0)])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        sim.modify_obstacles(removed=[(3, 0)])
+        # The edit alone revives the route but not the historical count.
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        sim.step()  # B still blocks the cell: the wait starts over at one.
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 1}],
+        )
+
+    def test_rejected_and_noop_edits_leave_waits_clock_history(self) -> None:
+        sim = self.build_corridor_wait()
+        before = copy.deepcopy(
+            (sim.status(), sim.map_change_history(), sim.tick, sim.replay)
+        )
+        for kwargs in (
+            {"added": [(9, 0)]},                # out of bounds
+            {"added": [(1, 0)]},                # robot currently there (A)
+            {"added": [(3, 0)], "removed": [(3, 0)]},  # add/remove conflict
+            {"added": [(True, 0)]},             # boolean coordinate
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    sim.modify_obstacles(**kwargs)
+        sim.modify_obstacles(added=[], removed=[])       # empty batch
+        sim.modify_obstacles(removed=[(0, 0)])           # traversable cell
+        self.assertEqual(
+            copy.deepcopy((sim.status(), sim.map_change_history(), sim.tick, sim.replay)),
+            before,
+        )
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}],
+        )
+
+    def test_paused_ticks_never_record_traffic_waits(self) -> None:
+        sim = self.build_corridor_wait()
+        sim.modify_obstacles(added=[(3, 0)])
+        for _ in range(3):
+            sim.step()
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.metrics()["traffic_waits"], [])
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(sim.paused_tasks, {"T"})
+
+
 class YieldDeterminismTests(unittest.TestCase):
     def test_input_list_order_does_not_change_results(self) -> None:
         first = swap_scenario()
