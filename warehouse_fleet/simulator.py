@@ -23,10 +23,12 @@ mileage, waiting does not. The task keeps its original robot, pickup and
 completion rules are unchanged, and a robot paused by map unreachability never
 takes part in yielding. If no safe side cell exists the robots simply wait:
 time advances, nothing collides and nothing completes early. Waiting caused
-purely by other robots is tracked per robot (consecutive ticks and the
-blocking robot) and reported by :meth:`FleetSimulator.status` and
-:meth:`FleetSimulator.metrics` as ``traffic_waits``, distinct from the
-map-unreachability ``paused_tasks``; the counter clears the moment the robot
+purely by other robots is tracked per robot (consecutive ticks and the robot
+occupying the next waypoint when the tick ends) and reported by
+:meth:`FleetSimulator.status` and :meth:`FleetSimulator.metrics` as
+``traffic_waits``, distinct from the map-unreachability ``paused_tasks``. A
+robot that stopped mid-tick but whose waypoint the blocker vacated before the
+tick ended is not reported; otherwise the counter clears the moment the robot
 moves again or the blockage ends. An accepted map edit reconciles the records
 immediately: a robot paused by the new map or no longer facing its recorded
 blocker on the replanned route loses its entry, an entry still facing the
@@ -525,16 +527,42 @@ class FleetSimulator:
                 return True
         return False
 
-    def _update_traffic_waits(self, blocked_by: dict[str, str]) -> None:
-        """Accumulate consecutive waits; any other outcome resets the counter."""
+    def _update_traffic_waits(
+        self,
+        blocked_by: dict[str, str],
+        occupied: dict[Position, str],
+    ) -> None:
+        """Accumulate waits that still hold at end of tick; reset the rest.
+
+        *blocked_by* records who each robot found in its way mid-tick, but a
+        blocker processed later in the same tick may have driven on (possibly
+        letting yet another robot take its old cell). Only a robot that actually
+        stopped for traffic and whose next waypoint is still occupied once the
+        tick settles keeps an entry; its blocker is whoever holds that cell at
+        tick end. A continued wait with a different blocker keeps the running
+        count, while moving, becoming unblocked mid-tick, or a next cell that
+        ends free clears the record.
+        """
+        still_waiting: dict[str, str] = {}
+        for robot_id in blocked_by:
+            robot = self.robots.get(robot_id)
+            if robot is None or not robot.route:
+                continue
+            occupant_id = occupied.get(robot.route[0])
+            if occupant_id is None or occupant_id == robot_id:
+                # The blocker cleared the way later in this same tick.
+                continue
+            still_waiting[robot_id] = occupant_id
         for robot_id in list(self._traffic_waits):
-            if robot_id not in blocked_by:
+            if robot_id not in still_waiting:
                 del self._traffic_waits[robot_id]
-        for robot_id, blocker_id in blocked_by.items():
+        for robot_id, blocker_id in still_waiting.items():
             entry = self._traffic_waits.get(robot_id)
             if entry is None:
                 self._traffic_waits[robot_id] = {"blocked_by": [blocker_id], "ticks": 1}
             else:
+                # The wait is uninterrupted; only the blocking robot may have
+                # changed, so the count continues with the new blocker.
                 entry["blocked_by"] = [blocker_id]
                 entry["ticks"] = int(entry["ticks"]) + 1
 
@@ -694,7 +722,7 @@ class FleetSimulator:
                 self._finish_if_arrived(robot)
                 continue
             blocked_by[robot.robot_id] = blocker_id
-        self._update_traffic_waits(blocked_by)
+        self._update_traffic_waits(blocked_by, occupied)
         self.tick += 1
         event: dict[str, object] = {
             "type": "tick",

@@ -106,8 +106,14 @@ simulator.status()["traffic_waits"]
 # [{"robot_id": "R-01", "blocked_by": ["R-02"], "ticks": 3}, ...]
 ```
 
-A robot's counter only grows while another robot blocks its next waypoint and
-it does not move; any move or the blockage clearing resets it to zero. The
+A robot's counter only grows on ticks where it stopped for another robot and
+its next waypoint is still occupied when the tick ends; `blocked_by` names the
+robot actually holding that cell. If the blocker moves on later in the same
+tick (even leaving the next cell to another robot), the robot is not reported
+as waiting that tick. Any move, or the next cell ending a tick free, resets the
+counter to zero; an uninterrupted wait whose blocker changes keeps the running
+count with the new blocker id, while being unblocked and blocked again later
+restarts it from one. The
 same report appears in `metrics()` (and therefore in the command-line
 output), and it is saved into and restored from checkpoints — older
 checkpoint files without it load with every counter at zero.

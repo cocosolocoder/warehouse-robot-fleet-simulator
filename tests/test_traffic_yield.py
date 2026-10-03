@@ -363,6 +363,74 @@ class NoSafePassingTests(unittest.TestCase):
         self.assertEqual(waits["R-2"]["ticks"], 3)
 
 
+class EndOfTickReconciliationTests(unittest.TestCase):
+    """A wait recorded mid-tick is dropped if the way ends the tick free."""
+
+    def build(self) -> FleetSimulator:
+        # Four-cell corridor: loaded A at (0,0) delivering to (2,0), loaded B
+        # at (1,0) delivering to (3,0). A is processed first and waits behind
+        # B; B then drives on, leaving A's next cell empty at tick end.
+        return FleetSimulator(
+            GridMap(4, 1),
+            [
+                Robot("A", (0, 0), route=[(1, 0), (2, 0)], task_id="T-A"),
+                Robot("B", (1, 0), route=[(2, 0), (3, 0)], task_id="T-B"),
+            ],
+            [
+                Task("T-A", (0, 0), (2, 0), assigned_robot="A", picked_up=True),
+                Task("T-B", (1, 0), (3, 0), assigned_robot="B", picked_up=True),
+            ],
+        )
+
+    def test_waiter_is_not_reported_once_blocker_drives_on_same_tick(self) -> None:
+        sim = self.build()
+        event = sim.step()
+        self.assertEqual(event["moved"], ["B"])
+        self.assertEqual(sim.robots["A"].position, (0, 0))
+        self.assertEqual(sim.robots["B"].position, (2, 0))
+        self.assertEqual(sim.robots["A"].distance_travelled, 0)
+        self.assertEqual(sim.robots["B"].distance_travelled, 1)
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.metrics()["traffic_waits"], [])
+
+    def test_checkpoint_keeps_the_cleared_state(self) -> None:
+        sim = self.build()
+        sim.step()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            sim.save_checkpoint(path)
+            loaded = FleetSimulator.load_checkpoint(path)
+        self.assertEqual(loaded.status(), sim.status())
+        self.assertEqual(loaded.status()["traffic_waits"], [])
+
+    def test_blocker_change_within_one_tick_names_the_actual_occupant(self) -> None:
+        # Corridor with one pocket at (2,1): busy B at (2,0) can drive on while
+        # C in the pocket takes (2,0) in the same tick. A, queued behind B,
+        # never moves but its next cell ends occupied by C -- the wait counts
+        # once and names C.
+        grid = GridMap(4, 2, frozenset({(0, 1), (1, 1), (3, 1)}))
+        sim = FleetSimulator(
+            grid,
+            [
+                Robot("A", (1, 0), route=[(2, 0), (3, 0)], task_id="T-A"),
+                Robot("B", (2, 0), route=[(3, 0)], task_id="T-B"),
+                Robot("C", (2, 1), route=[(2, 0), (1, 0), (0, 0)], task_id="T-C"),
+            ],
+            [
+                Task("T-A", (1, 0), (3, 0), assigned_robot="A", picked_up=True),
+                Task("T-B", (2, 0), (3, 0), assigned_robot="B", picked_up=True),
+                Task("T-C", (2, 1), (0, 0), assigned_robot="C", picked_up=True),
+            ],
+        )
+        event = sim.step()
+        self.assertEqual(sorted(event["moved"]), ["B", "C"])
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["C"], "ticks": 1}],
+        )
+
+
 class TrafficWaitResetTests(unittest.TestCase):
     def test_wait_counter_resets_once_the_robot_moves(self) -> None:
         sim = swap_scenario()
