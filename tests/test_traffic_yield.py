@@ -197,6 +197,117 @@ class NoSafePassingTests(unittest.TestCase):
         self.assertEqual(waits["R-2"]["ticks"], 3)
 
 
+class FutileRetreatTests(unittest.TestCase):
+    """A blocked robot must not retreat and return to the same blockage."""
+
+    def build(self, width: int = 3) -> FleetSimulator:
+        # Pure one-row corridor: A loaded one cell before its dropoff, an idle
+        # robot parked exactly on the dropoff, with only empty cells behind A.
+        return FleetSimulator(
+            GridMap(width, 1),
+            [
+                Robot("A", (width - 2, 0), route=[(width - 1, 0)], task_id="T-1"),
+                Robot("B", (width - 1, 0)),
+            ],
+            [
+                Task(
+                    "T-1",
+                    (width - 2, 0),
+                    (width - 1, 0),
+                    assigned_robot="A",
+                    picked_up=True,
+                )
+            ],
+        )
+
+    def test_both_robots_wait_in_place_without_retreat(self) -> None:
+        sim = self.build()
+        for _ in range(5):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+        self.assertEqual(sim.tick, 5)
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(sim.robots["B"].position, (2, 0))
+
+    def test_empty_cells_behind_do_not_justify_ping_pong(self) -> None:
+        # More room behind A changes nothing: there is still no way around B.
+        sim = self.build(width=6)
+        for _ in range(5):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+        self.assertEqual(sim.robots["A"].position, (4, 0))
+        self.assertEqual(sim.robots["B"].position, (5, 0))
+
+    def test_waiting_accrues_no_mileage_and_keeps_replay_positions(self) -> None:
+        sim = self.build()
+        sim.step()
+        sim.step()
+        self.assertEqual(sim.robots["A"].distance_travelled, 0)
+        self.assertEqual(sim.robots["B"].distance_travelled, 0)
+        self.assertEqual(sim.metrics()["distance_total"], 0)
+        for frame in sim.replay:
+            if frame.get("type") == "tick":
+                self.assertEqual(frame["moved"], [])
+                self.assertEqual(frame["robots"], {"A": [1, 0], "B": [2, 0]})
+
+    def test_task_stays_picked_up_uncompleted_and_owned_by_a(self) -> None:
+        sim = self.build()
+        for _ in range(4):
+            sim.step()
+        task = sim.tasks["T-1"]
+        self.assertTrue(task.picked_up)
+        self.assertFalse(task.completed)
+        self.assertEqual(task.assigned_robot, "A")
+        self.assertEqual(sim.robots["A"].task_id, "T-1")
+        self.assertIsNone(sim.robots["B"].task_id)
+        # A traffic jam is not a map-unreachability pause.
+        self.assertEqual(sim.status()["paused_tasks"], [])
+        self.assertEqual(sim.metrics()["tasks_paused"], [])
+
+    def test_traffic_wait_reports_grow_and_match_in_status_and_metrics(self) -> None:
+        sim = self.build()
+        sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 1}],
+        )
+        for expected in (2, 3, 4):
+            sim.step()
+            self.assertEqual(
+                sim.status()["traffic_waits"],
+                [{"robot_id": "A", "blocked_by": ["B"], "ticks": expected}],
+            )
+        self.assertEqual(sim.metrics()["traffic_waits"], sim.status()["traffic_waits"])
+
+    def test_resuming_once_blocker_clears_resets_the_wait_counter(self) -> None:
+        # The side pocket at (2, 1) is closed at first: B cannot yield, A waits.
+        grid = GridMap(3, 2, frozenset({(0, 1), (1, 1), (2, 1)}))
+        sim = FleetSimulator(
+            grid,
+            [
+                Robot("A", (0, 0), route=[(1, 0), (2, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (0, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+        sim.step()  # A -> (1,0)
+        sim.step()  # blocked, pocket closed
+        sim.step()  # still blocked
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+        sim.modify_obstacles(removed=[(2, 1)])
+        sim.step()  # B yields into the pocket; A takes (2,0) and completes
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertTrue(sim.tasks["T-1"].completed)
+        self.assertEqual(sim.robots["A"].position, (2, 0))
+        self.assertEqual(sim.robots["B"].position, (2, 1))
+        # The waiting ticks themselves never counted as mileage.
+        self.assertEqual(sim.robots["A"].distance_travelled, 2)
+        self.assertEqual(sim.robots["B"].distance_travelled, 1)
+
+
 class TrafficWaitResetTests(unittest.TestCase):
     def test_wait_counter_resets_once_the_robot_moves(self) -> None:
         sim = swap_scenario()

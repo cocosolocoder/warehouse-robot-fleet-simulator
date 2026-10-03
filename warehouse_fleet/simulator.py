@@ -351,17 +351,32 @@ class FleetSimulator:
         task: Task | None,
         occupied: dict[Position, str],
         reserved: dict[Position, str],
+        blocker: Robot,
     ) -> tuple[Position, list[Position]] | None:
         """Best side cell plus replanned route for a blocked robot, or None.
 
         Only cells off every other robot's planned route qualify, and only if
-        the task remains reachable from there; stepping backwards along the
-        corridor is never useful and would just oscillate. Candidates are
-        ranked by replanned route length with the deterministic neighbor order
-        (up, left, right, down) breaking ties.
+        the task remains reachable from there; candidates are ranked by
+        replanned route length with the deterministic neighbor order (up,
+        left, right, down) breaking ties.
+
+        A sidestep must actually clear the impasse. Stepping backwards along a
+        dead-end corridor and then routing back through the cell the blocker
+        still occupies merely oscillates -- the robot would return to the same
+        blockage next tick, wasting mileage and masking a genuine traffic
+        wait. Such a candidate is rejected unless the blocker is a task robot
+        whose own next waypoint is the requester's current cell: vacating it
+        lets the blocker drive on through, so the replanned route no longer
+        runs into it. A true geometric bypass, whose replanned route never
+        touches the blocker's cell, is always accepted.
         """
         if task is None or task.completed:
             return None
+        vacating_lets_blocker_through = (
+            blocker.task_id is not None
+            and bool(blocker.route)
+            and blocker.route[0] == robot.position
+        )
         on_routes = self._route_cells(exclude_id=robot.robot_id)
         best: tuple[int, int, Position, list[Position]] | None = None
         for index, cell in enumerate(self.grid.neighbors(robot.position)):
@@ -369,6 +384,11 @@ class FleetSimulator:
                 continue
             route = self._plan_route(robot, task, start=cell)
             if route is None:
+                continue
+            if blocker.position in route and not vacating_lets_blocker_through:
+                # The replanned route runs straight back into a robot that is
+                # not about to drive through the vacated cell; this sidestep
+                # cannot produce forward progress.
                 continue
             if best is None or (len(route), index) < (best[0], best[1]):
                 best = (len(route), index, cell, route)
@@ -515,7 +535,7 @@ class FleetSimulator:
                         continue
             # The blocker cannot or will not move this tick: try to sidestep
             # onto a free adjacent cell and replan from there.
-            side = self._self_sidestep(robot, task, occupied, reserved)
+            side = self._self_sidestep(robot, task, occupied, reserved, blocker)
             if side is not None:
                 cell, route = side
                 relocate(robot, cell)
