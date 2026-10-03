@@ -302,6 +302,145 @@ class RerouteAndPauseTests(unittest.TestCase):
         self.assertTrue(sim.tasks["TB"].completed)
 
 
+class TrafficWaitReconciliationTests(unittest.TestCase):
+    """Accepted map edits reconcile traffic-wait records immediately."""
+
+    def queued_sim(self) -> FleetSimulator:
+        # 5x1 corridor: loaded A queued behind idle B, which cannot yield
+        # ((1,0) is the requester's cell, (3,0) lies on A's route).
+        return FleetSimulator(
+            GridMap(5, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0), (3, 0), (4, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (1, 0), (4, 0), assigned_robot="A", picked_up=True)],
+        )
+
+    def waiting_sim(self) -> FleetSimulator:
+        sim = self.queued_sim()
+        sim.step()
+        sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+        return sim
+
+    def test_pause_drops_wait_and_checkpoint_loads_without_a_step(self) -> None:
+        sim = self.waiting_sim()
+        sim.modify_obstacles(added=[(4, 0)])  # seals the dropoff: T-1 pauses
+        self.assertEqual(sim.status()["paused_tasks"], ["T-1"])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.metrics()["traffic_waits"], [])
+        # Ownership, cargo and position follow the usual pause rules.
+        self.assertEqual(sim.tasks["T-1"].assigned_robot, "A")
+        self.assertTrue(sim.tasks["T-1"].picked_up)
+        self.assertEqual(sim.robots["A"].task_id, "T-1")
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        loaded = save_load(sim)
+        self.assertEqual(loaded.status(), sim.status())
+        self.assertEqual(loaded.paused_tasks, {"T-1"})
+        self.assertEqual(loaded.status()["traffic_waits"], [])
+
+    def test_reopen_does_not_restore_old_wait_count(self) -> None:
+        sim = self.waiting_sim()
+        sim.modify_obstacles(added=[(4, 0)])
+        sim.modify_obstacles(removed=[(4, 0)])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        sim.step()  # blocked by B again: a fresh wait starts at one
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 1}],
+        )
+
+    def test_unrelated_edit_keeps_wait_count_unchanged(self) -> None:
+        sim = self.waiting_sim()
+        sim.modify_obstacles(added=[(0, 0)])
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+        sim.modify_obstacles(removed=[(0, 0)])
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+
+    def test_reroute_off_the_blocker_drops_the_entry(self) -> None:
+        # 3x3 with (0,0),(1,1) blocked: A can only face B; B cannot yield.
+        sim = FleetSimulator(
+            GridMap(3, 3, frozenset({(0, 0), (1, 1)})),
+            [
+                Robot("A", (1, 0), route=[(2, 0), (2, 1), (2, 2)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (1, 0), (2, 2), assigned_robot="A", picked_up=True)],
+        )
+        sim.step()
+        sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+        # Open (1,1) and close (2,1): the detour no longer passes B's cell.
+        sim.modify_obstacles(added=[(2, 1)], removed=[(1, 1)])
+        self.assertEqual(sim.robots["A"].route[0], (1, 1))
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.metrics()["traffic_waits"], [])
+        # The edit itself neither moved the robot nor completed the task.
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertFalse(sim.tasks["T-1"].completed)
+        self.assertEqual(sim.paused_tasks, set())
+        loaded = save_load(sim)
+        self.assertEqual(loaded.status(), sim.status())
+
+    def test_rejected_and_noop_edits_preserve_waits_clock_and_history(self) -> None:
+        sim = self.waiting_sim()
+        before = (
+            sim.status()["traffic_waits"],
+            sim.tick,
+            sim.map_change_history(),
+        )
+        for bad in (
+            dict(added=[(9, 0)]),
+            dict(added=[(1, 0)]),  # a robot's current cell
+            dict(added=[(1.5, 0)]),
+            dict(added=[(0, 0)], removed=[(0, 0)]),
+            dict(removed=[(8, 8)]),
+        ):
+            with self.assertRaises(ValueError):
+                sim.modify_obstacles(**bad)
+        self.assertEqual(
+            (sim.status()["traffic_waits"], sim.tick, sim.map_change_history()),
+            before,
+        )
+        sim.modify_obstacles(added=[(0, 0)])  # a real edit, to set up no-ops
+        history = sim.map_change_history()
+        sim.modify_obstacles(added=[(0, 0)])  # already an obstacle: no-op
+        sim.modify_obstacles(removed=[(3, 0)])  # already free: no-op
+        sim.modify_obstacles()  # empty batch: no-op
+        self.assertEqual(sim.map_change_history(), history)
+        self.assertEqual(sim.status()["traffic_waits"], before[0])
+        self.assertEqual(sim.tick, before[1])
+
+    def test_edit_never_creates_or_increments_a_wait(self) -> None:
+        sim = self.queued_sim()
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        sim.modify_obstacles(added=[(0, 0)])
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        sim.step()
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 1}],
+        )
+        sim.modify_obstacles(removed=[(0, 0)])
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 1}],
+        )
+
+
 class ReplayMapChangeTests(unittest.TestCase):
     def test_map_change_frames_recorded_with_effective_tick(self) -> None:
         sim = corridor_sim(6)

@@ -27,7 +27,10 @@ purely by other robots is tracked per robot (consecutive ticks and the
 blocking robot) and reported by :meth:`FleetSimulator.status` and
 :meth:`FleetSimulator.metrics` as ``traffic_waits``, distinct from the
 map-unreachability ``paused_tasks``; the counter clears the moment the robot
-moves again or the blockage ends.
+moves again or the blockage ends. An accepted map edit reconciles the records
+immediately: a robot paused by the new map or no longer facing its recorded
+blocker on the replanned route loses its entry, an entry still facing the
+same blocker keeps its count, and no edit ever creates or increments one.
 
 Checkpoint file format
 ----------------------
@@ -241,6 +244,7 @@ class FleetSimulator:
         self.map_changes.append(copy.deepcopy(record))
         self.replay.append(copy.deepcopy(record))
         self._reroute_after_map_change()
+        self._reconcile_traffic_waits_after_map_change()
         return copy.deepcopy(record)
 
     def _map_change_record(
@@ -533,6 +537,26 @@ class FleetSimulator:
             else:
                 entry["blocked_by"] = [blocker_id]
                 entry["ticks"] = int(entry["ticks"]) + 1
+
+    def _reconcile_traffic_waits_after_map_change(self) -> None:
+        """Drop wait records an accepted map edit has invalidated.
+
+        A map change never moves a robot, so it can neither create a wait nor
+        add to one; but it can end one. A robot whose task just paused on
+        unreachability has no route left to wait on, and a robot whose
+        replanned next cell is no longer held by the recorded blocker is not
+        blocked by it anymore -- both records are removed. An entry whose
+        robot still faces the very same blocker on its refreshed route keeps
+        its count untouched, whatever else the edit changed.
+        """
+        occupied = {robot.position: robot.robot_id for robot in self.robots.values()}
+        for robot_id, entry in list(self._traffic_waits.items()):
+            robot = self.robots.get(robot_id)
+            if robot is None or not robot.route:
+                del self._traffic_waits[robot_id]
+                continue
+            if occupied.get(robot.route[0]) not in entry["blocked_by"]:
+                del self._traffic_waits[robot_id]
 
     def _traffic_wait_report(self) -> list[dict[str, object]]:
         return [
