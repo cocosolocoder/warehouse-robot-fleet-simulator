@@ -80,6 +80,16 @@ drive on may sidestep onto a free adjacent cell itself and replan its
 orthogonal cell per tick (or waits), robots never share a cell at the end of
 a tick, never swap places within one tick, and never enter an obstacle.
 
+A sidestep that cannot make progress is not taken. If the replanned route
+steps straight back through the cell the robot is vacating, still runs past
+the same blocker's cell, and the blocker cannot use the opening to get out of
+the way (for example an idle robot parked at the end of a one-wide corridor
+with no neighbouring cell to yield onto), the robot waits instead of
+retreating and shuttling back to the identical blockage on the next tick.
+More empty cells behind the waiting robot do not change this. A sidestep that
+genuinely routes around the blocker, or a retreat the blocker immediately
+drives into to clear the way, is still driven.
+
 Yielding moves count as mileage; waiting does not. The task keeps its
 original robot and the pickup rules are unchanged — goods are collected
 before delivery, a loaded robot never returns to the pickup cell, and nothing

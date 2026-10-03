@@ -13,15 +13,21 @@ When a robot's next waypoint is occupied by another robot, ``step()`` tries to
 keep traffic flowing instead of waiting forever: an idle blocker is asked to
 move onto a free side cell that lies on no robot's planned route, and a busy
 robot facing a blocker that cannot drive on may itself sidestep onto a free
-adjacent cell and replan its (still shortest) route from there. Yield moves
-count as mileage, waiting does not. The task keeps its original robot, pickup
-and completion rules are unchanged, and a robot paused by map unreachability
-never takes part in yielding. If no safe side cell exists the robots simply
-wait: time advances, nothing collides and nothing completes early. Waiting
-caused purely by other robots is tracked per robot (consecutive ticks and the
+adjacent cell and replan its (still shortest) route from there. A retreat that
+only leads back to the same immovable blocker is never taken though: if the
+replanned route immediately returns through the vacated cell, still passes the
+blocker's cell and the blocker cannot use the opening to leave (a dead end or
+corridor end with traffic parked beyond it), the robot simply waits -- extra
+empty cells stretching out behind it change nothing. Yield moves count as
+mileage, waiting does not. The task keeps its original robot, pickup and
+completion rules are unchanged, and a robot paused by map unreachability never
+takes part in yielding. If no safe side cell exists the robots simply wait:
+time advances, nothing collides and nothing completes early. Waiting caused
+purely by other robots is tracked per robot (consecutive ticks and the
 blocking robot) and reported by :meth:`FleetSimulator.status` and
 :meth:`FleetSimulator.metrics` as ``traffic_waits``, distinct from the
-map-unreachability ``paused_tasks``.
+map-unreachability ``paused_tasks``; the counter clears the moment the robot
+moves again or the blockage ends.
 
 Checkpoint file format
 ----------------------
@@ -351,17 +357,26 @@ class FleetSimulator:
         task: Task | None,
         occupied: dict[Position, str],
         reserved: dict[Position, str],
+        already_moved: frozenset[str] = frozenset(),
     ) -> tuple[Position, list[Position]] | None:
         """Best side cell plus replanned route for a blocked robot, or None.
 
         Only cells off every other robot's planned route qualify, and only if
-        the task remains reachable from there; stepping backwards along the
-        corridor is never useful and would just oscillate. Candidates are
-        ranked by replanned route length with the deterministic neighbor order
-        (up, left, right, down) breaking ties.
+        the task remains reachable from there. A candidate that merely retreats
+        along the corridor only to face the very same blocker again on the next
+        tick is rejected too: such a move records mileage and gets undone
+        forever instead of making progress, even when more empty cells stretch
+        out behind the robot. Candidates are ranked by replanned route length
+        with the deterministic neighbor order (up, left, right, down) breaking
+        ties. *already_moved* names robots that have used their one move of
+        this tick and therefore cannot vacate a cell to resolve the block.
         """
         if task is None or task.completed:
             return None
+        destination = robot.route[0]
+        blocker_id = occupied.get(destination)
+        if blocker_id is None:
+            blocker_id = reserved.get(destination)
         on_routes = self._route_cells(exclude_id=robot.robot_id)
         best: tuple[int, int, Position, list[Position]] | None = None
         for index, cell in enumerate(self.grid.neighbors(robot.position)):
@@ -370,11 +385,141 @@ class FleetSimulator:
             route = self._plan_route(robot, task, start=cell)
             if route is None:
                 continue
+            if (
+                blocker_id is not None
+                and blocker_id != robot.robot_id
+                and self._is_bounceback_retreat(
+                    robot, cell, route, blocker_id, occupied, reserved, already_moved
+                )
+            ):
+                # The replanned route immediately returns through the cell the
+                # robot is vacating and the blocker cannot use that opening to
+                # leave: the move would be undone on the next tick.
+                continue
             if best is None or (len(route), index) < (best[0], best[1]):
                 best = (len(route), index, cell, route)
         if best is None:
             return None
         return best[2], best[3]
+
+    def _is_bounceback_retreat(
+        self,
+        robot: Robot,
+        side: Position,
+        replanned: Sequence[Position],
+        blocker_id: str,
+        occupied: dict[Position, str],
+        reserved: dict[Position, str],
+        already_moved: frozenset[str],
+    ) -> bool:
+        """Whether stepping to *side* only sends the robot back to the block.
+
+        A retreat is futile when the replanned route leads straight back through
+        the robot's current cell and still runs through the blocker's cell (so
+        the side move is undone next tick with the same blocker ahead) while
+        the blocker cannot leave its own cell through the gap that opens up.
+        A route that bypasses the blocker entirely is a genuine detour and is
+        never rejected here.
+        """
+        if not replanned or replanned[0] != robot.position:
+            return False
+        blocker = self.robots.get(blocker_id)
+        if blocker is None or blocker.position not in replanned:
+            return False
+        # Hypothetical end-of-tick layout: the requester has vacated its cell
+        # and stands on the candidate side cell.
+        hyp_occupied = dict(occupied)
+        del hyp_occupied[robot.position]
+        hyp_occupied[side] = robot.robot_id
+        # The requester only gets back onto its route by driving through these
+        # cells, so a blocker may only "leave" by driving on, never by parking
+        # on the replanned route. The requester cannot make a second move
+        # within this tick, and neither can a robot that already moved.
+        blocked_path = frozenset(replanned)
+        return not self._can_vacate(
+            blocker,
+            robot,
+            hyp_occupied,
+            reserved,
+            frozenset({robot.robot_id}) | already_moved,
+            blocked_path,
+        )
+
+    def _can_vacate(
+        self,
+        blocker: Robot,
+        requester: Robot,
+        occupied: dict[Position, str],
+        reserved: dict[Position, str],
+        checking: frozenset[str],
+        blocked_path: frozenset[Position],
+    ) -> bool:
+        """Whether *blocker* can leave its cell this tick in the given layout.
+
+        An idle blocker leaves only by yielding onto a safe side cell for the
+        requesting robot; a busy blocker leaves by driving onto its next
+        waypoint (possibly following a chain of robots that all move this tick)
+        or by sidestepping onto a free adjacent cell itself. Robots paused by
+        map unreachability never move. *checking* names robots whose leave
+        check is already on the call stack, so a cyclic dependency (a head-on
+        deadlock, or the requester itself) is not assumed resolvable.
+        *blocked_path* holds the cells the retreating requester must drive back
+        through: another robot parking there only moves the blockage, so such
+        sidesteps do not count as leaving (driving on along the cell on the
+        blocker's own route does).
+        """
+        if blocker.robot_id in checking:
+            return False
+        task = self.tasks[blocker.task_id] if blocker.task_id is not None else None
+        if task is not None and task.task_id in self.paused_tasks:
+            return False
+        if task is not None and not blocker.route:
+            # A busy robot with no route left only arrives/finishes this tick;
+            # it never drives or sidesteps for anyone.
+            return False
+        if task is None:
+            # Idle robots only ever move by yielding for a requester.
+            side = self._idle_sidestep_cell(blocker, requester, occupied, reserved)
+            return side is not None and side not in blocked_path
+        if blocker.route:
+            ahead = blocker.route[0]
+            if (
+                self.grid.traversable(ahead)
+                and ahead not in occupied
+                and ahead not in reserved
+            ):
+                return True
+            occupant_id = occupied.get(ahead) or reserved.get(ahead)
+            if (
+                occupant_id is not None
+                and occupant_id != blocker.robot_id
+                and occupant_id not in checking
+            ):
+                # The blocker could follow the robot ahead once that robot
+                # vacates its cell this same tick.
+                if self._can_vacate(
+                    self.robots[occupant_id],
+                    requester,
+                    occupied,
+                    reserved,
+                    checking | {blocker.robot_id},
+                    blocked_path,
+                ):
+                    return True
+        # Otherwise the blocker might sidestep onto a free side cell itself,
+        # but not onto a cell the retreating requester still has to use.
+        on_routes = self._route_cells(exclude_id=blocker.robot_id)
+        for side_cell in self.grid.neighbors(blocker.position):
+            if (
+                side_cell in occupied
+                or side_cell in reserved
+                or side_cell in on_routes
+                or side_cell in blocked_path
+            ):
+                continue
+            if self._plan_route(blocker, task, start=side_cell) is not None:
+                return True
+        return False
 
     def _update_traffic_waits(self, blocked_by: dict[str, str]) -> None:
         """Accumulate consecutive waits; any other outcome resets the counter."""
@@ -515,7 +660,9 @@ class FleetSimulator:
                         continue
             # The blocker cannot or will not move this tick: try to sidestep
             # onto a free adjacent cell and replan from there.
-            side = self._self_sidestep(robot, task, occupied, reserved)
+            side = self._self_sidestep(
+                robot, task, occupied, reserved, frozenset(moved_ids)
+            )
             if side is not None:
                 cell, route = side
                 relocate(robot, cell)

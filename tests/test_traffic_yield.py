@@ -146,6 +146,172 @@ class IdleYieldTests(unittest.TestCase):
         self.assertTrue(sim.tasks["T-2"].completed)
 
 
+class DeadEndRetreatTests(unittest.TestCase):
+    """A retreat that only returns to the same blocker is not a detour."""
+
+    def build_three_cell(self) -> FleetSimulator:
+        # Single row: (0,0) empty, A loaded at (1,0) delivering to (2,0),
+        # where idle B is parked. B has no neighbour it can yield onto.
+        return FleetSimulator(
+            GridMap(3, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+
+    def test_step_keeps_both_robots_on_their_cells(self) -> None:
+        sim = self.build_three_cell()
+        for _ in range(5):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.robots["A"].position, (1, 0))
+            self.assertEqual(sim.robots["B"].position, (2, 0))
+
+    def test_time_advances_but_neither_mileage_nor_replay_positions_change(self) -> None:
+        sim = self.build_three_cell()
+        sim.step()
+        positions = {
+            robot_id: tuple(cell)
+            for robot_id, cell in sim.replay[-1]["robots"].items()
+        }
+        for _ in range(4):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(
+                {rid: tuple(cell) for rid, cell in event["robots"].items()},
+                positions,
+            )
+        self.assertEqual(sim.tick, 5)
+        self.assertEqual(sim.robots["A"].distance_travelled, 0)
+        self.assertEqual(sim.robots["B"].distance_travelled, 0)
+        self.assertEqual(sim.metrics()["distance_total"], 0)
+
+    def test_task_cargo_and_idle_state_are_preserved(self) -> None:
+        sim = self.build_three_cell()
+        for _ in range(4):
+            sim.step()
+        task = sim.tasks["T-1"]
+        self.assertTrue(task.picked_up)
+        self.assertFalse(task.completed)
+        self.assertEqual(task.assigned_robot, "A")
+        self.assertEqual(sim.robots["A"].task_id, "T-1")
+        self.assertEqual(sim.robots["A"].route, [(2, 0)])
+        self.assertIsNone(sim.robots["B"].task_id)
+        # Traffic waiting, not a map-unreachability pause.
+        self.assertEqual(sim.status()["paused_tasks"], [])
+
+    def test_traffic_wait_is_reported_by_status_and_metrics_and_grows(self) -> None:
+        sim = self.build_three_cell()
+        for expected in range(1, 5):
+            sim.step()
+            report = [
+                entry
+                for entry in sim.status()["traffic_waits"]
+                if entry["robot_id"] == "A"
+            ]
+            self.assertEqual(
+                report, [{"robot_id": "A", "blocked_by": ["B"], "ticks": expected}]
+            )
+            self.assertEqual(
+                sim.metrics()["traffic_waits"], sim.status()["traffic_waits"]
+            )
+        self.assertNotIn(
+            "B", {entry["robot_id"] for entry in sim.status()["traffic_waits"]}
+        )
+
+    def test_empty_cells_behind_do_not_justify_shuttling(self) -> None:
+        # A longer corridor with several empty cells behind A must not restart
+        # the back-and-forth either.
+        sim = FleetSimulator(
+            GridMap(6, 1),
+            [
+                Robot("A", (4, 0), route=[(5, 0)], task_id="T-1"),
+                Robot("B", (5, 0)),
+            ],
+            [Task("T-1", (4, 0), (5, 0), assigned_robot="A", picked_up=True)],
+        )
+        for _ in range(5):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.robots["A"].position, (4, 0))
+            self.assertEqual(sim.robots["A"].distance_travelled, 0)
+
+    def test_busy_blocker_at_corridor_end_also_waits_instead_of_retreating(self) -> None:
+        # B is executing a task but its only way home leads through A's cell;
+        # neither robot can leave the corridor.
+        sim = FleetSimulator(
+            GridMap(3, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0), route=[(1, 0), (0, 0)], task_id="T-2"),
+            ],
+            [
+                Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True),
+                Task("T-2", (2, 0), (0, 0), assigned_robot="B", picked_up=True),
+            ],
+        )
+        for _ in range(4):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.robots["A"].position, (1, 0))
+            self.assertEqual(sim.robots["B"].position, (2, 0))
+        self.assertEqual(sim.robots["A"].distance_travelled, 0)
+        self.assertEqual(sim.robots["B"].distance_travelled, 0)
+
+    def test_waiting_resumes_once_the_blocker_can_yield(self) -> None:
+        # Same dead end, but a side pocket next to B opens later: B yields, A
+        # delivers, and the consecutive-wait record is cleared.
+        sim = FleetSimulator(
+            GridMap(3, 2, frozenset({(0, 1), (1, 1), (2, 1)})),
+            [
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+        sim.step()
+        sim.step()
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(
+            sim.status()["traffic_waits"],
+            [{"robot_id": "A", "blocked_by": ["B"], "ticks": 2}],
+        )
+        sim.modify_obstacles(removed=[(2, 1)])
+        event = sim.step()
+        self.assertEqual(event["moved"], ["B", "A"])
+        self.assertEqual(sim.robots["B"].position, (2, 1))
+        self.assertEqual(sim.robots["A"].position, (2, 0))
+        self.assertTrue(sim.tasks["T-1"].completed)
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.robots["A"].distance_travelled, 1)
+
+    def test_genuine_detour_around_blocker_is_still_driven(self) -> None:
+        # A busy blocker facing the requester cannot drive on, but the open
+        # second row lets the requester sidestep and route around instead of
+        # bouncing back. That move must still happen and count as mileage.
+        sim = FleetSimulator(
+            GridMap(3, 2),
+            [
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0), route=[(1, 0), (0, 0)], task_id="T-2"),
+            ],
+            [
+                Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True),
+                Task("T-2", (2, 0), (0, 0), assigned_robot="B", picked_up=True),
+            ],
+        )
+        event = sim.step()
+        self.assertIn("A", event["moved"])
+        self.assertEqual(sim.robots["A"].position, (1, 1))
+        self.assertEqual(sim.robots["A"].distance_travelled, 1)
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        used = run_until_done(sim, 10)
+        self.assertNotEqual(used, -1)
+        self.assertEqual(sim.robots["A"].position, (2, 0))
+
+
 class NoSafePassingTests(unittest.TestCase):
     def build(self) -> FleetSimulator:
         # Pure 5x1 corridor: no side cell exists at all.
