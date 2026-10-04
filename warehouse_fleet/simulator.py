@@ -172,6 +172,55 @@ def _as_pair(value: object, description: str) -> tuple[int, int]:
     return value[0], value[1]
 
 
+def _task_route_waypoints(origin: Position, task: Task) -> list[Position]:
+    """Required remaining visit points after *origin* for *task*.
+
+    The same pickup/delivery rule is used by first-time assignment, rerouting
+    after map changes (and the recovery/sidestep planning that shares it) and
+    checkpoint validation, so the requirement lives in exactly one place:
+
+    * Goods not yet collected: the route must still reach the pickup and then
+      the dropoff. Standing exactly on the pickup makes the pickup leg empty --
+      the leg contributes no waypoint -- but planning never collects or
+      completes anything by itself.
+    * Goods already collected: the robot routes straight to the dropoff, even
+      when the old pickup cell was closed afterwards; it is never sent back.
+
+    When *origin*, pickup and dropoff coincide the list is empty, which
+    describes a feasible zero-step route and must not be confused with an
+    unreachable one.
+    """
+    waypoints: list[Position] = []
+    if not task.picked_up and origin != task.pickup:
+        waypoints.append(task.pickup)
+    last = waypoints[-1] if waypoints else origin
+    if task.dropoff != last:
+        waypoints.append(task.dropoff)
+    return waypoints
+
+
+def _plan_task_route(
+    grid: GridMap, origin: Position, task: Task
+) -> list[Position] | None:
+    """Shortest feasible route through the task's required waypoints.
+
+    The returned list holds the cells after *origin* only, concatenating the
+    deterministic shortest legs between consecutive required points. It is
+    ``None`` when any required point cannot be reached, and an empty list for a
+    feasible route with zero steps (origin already at the only destination).
+    """
+    route: list[Position] = []
+    current = origin
+    for waypoint in _task_route_waypoints(origin, task):
+        try:
+            leg = shortest_path(grid, current, waypoint)
+        except ValueError:
+            return None
+        route.extend(leg)
+        current = waypoint
+    return route
+
+
 class FleetSimulator:
     def __init__(self, grid: GridMap, robots: list[Robot], tasks: list[Task]) -> None:
         self.grid = grid
@@ -289,24 +338,12 @@ class FleetSimulator:
         """Shortest current->pickup->dropoff route, or None if unreachable.
 
         *start* overrides the robot's current position, which is how sidestep
-        candidates are evaluated without moving the robot first.
+        candidates are evaluated without moving the robot first. The
+        pickup/delivery rule itself is shared with first-time assignment and
+        checkpoint validation via :func:`_plan_task_route`.
         """
         origin = robot.position if start is None else start
-        try:
-            if not task.picked_up:
-                if origin == task.pickup:
-                    to_pickup: list[Position] = []
-                else:
-                    to_pickup = shortest_path(self.grid, origin, task.pickup)
-                to_dropoff = shortest_path(self.grid, task.pickup, task.dropoff)
-            else:
-                # Goods are already on board: a reclosed pickup cell must not
-                # pull the robot back.
-                to_pickup = []
-                to_dropoff = shortest_path(self.grid, origin, task.dropoff)
-        except ValueError:
-            return None
-        return to_pickup + to_dropoff
+        return _plan_task_route(self.grid, origin, task)
 
     def _reroute_after_map_change(self) -> None:
         for task in self.tasks.values():
@@ -636,10 +673,8 @@ class FleetSimulator:
             for robot in self.robots.values():
                 if not robot.idle:
                     continue
-                try:
-                    route = shortest_path(self.grid, robot.position, task.pickup)
-                    route += shortest_path(self.grid, task.pickup, task.dropoff)
-                except ValueError:
+                route = _plan_task_route(self.grid, robot.position, task)
+                if route is None:
                     continue
                 choices.append((len(route), robot.robot_id, route))
             if not choices:
@@ -1403,18 +1438,9 @@ class FleetSimulator:
                 )
             if grid is not None:
                 # A saved pause must reflect genuine unreachability on the
-                # saved map; otherwise the history is inconsistent.
-                reachable = True
-                try:
-                    if not task.picked_up:
-                        if owner.position != task.pickup:
-                            shortest_path(grid, owner.position, task.pickup)
-                        shortest_path(grid, task.pickup, task.dropoff)
-                    else:
-                        shortest_path(grid, owner.position, task.dropoff)
-                except ValueError:
-                    reachable = False
-                if reachable:
+                # saved map; otherwise the history is inconsistent. The same
+                # pickup-state-aware route rule used at runtime decides this.
+                if _plan_task_route(grid, owner.position, task) is not None:
                     raise ValueError(
                         f"paused task {task_id!r} is actually reachable on the saved map"
                     )
@@ -1428,16 +1454,19 @@ class FleetSimulator:
         """Reject routes that cannot finish the task each robot is bound to.
 
         Traversability and adjacency are checked elsewhere. This enforces the
-        pickup/delivery business rules for tasks that are assigned, unfinished
-        and not paused by map unreachability: a non-empty route must end at the
-        dropoff, and a robot that has not collected yet -- and is not already
-        standing on the pickup cell -- must still pass through the pickup.
-        Passing the dropoff early changes nothing; the route only has to reach
-        the pickup first and return. Empty routes are legal only when the
-        loaded robot is already at the dropoff, or when position, pickup and
-        dropoff all coincide (the goods are collected on resume). Paused tasks
-        keep their empty-route exemption, and unassigned or completed tasks are
-        not judged as work in progress.
+        pickup/delivery business rules -- the very same waypoint requirement
+        :func:`_task_route_waypoints` plans with -- for tasks that are
+        assigned, unfinished and not paused by map unreachability: a non-empty
+        route must end at the dropoff, and a robot that has not collected yet
+        -- and is not already standing on the pickup cell -- must still pass
+        through the pickup. Passing the dropoff early changes nothing; the
+        route only has to reach the pickup and return, and saved avoidance
+        detours need not match a replanned shortest route. Empty routes are
+        legal only when no remaining waypoint is required: the loaded robot is
+        already at the dropoff, or position, pickup and dropoff all coincide
+        (the goods are collected on resume). Paused tasks keep their empty-route
+        exemption, and unassigned or completed tasks are not judged as work in
+        progress.
         """
         for task in task_by_id.values():
             if task.completed or task.assigned_robot is None:
@@ -1455,6 +1484,7 @@ class FleetSimulator:
             label = (
                 f"task {task.task_id!r} assigned to robot {robot.robot_id!r}"
             )
+            required = _task_route_waypoints(robot.position, task)
             if route:
                 if route[-1] != task.dropoff:
                     raise ValueError(
@@ -1462,11 +1492,7 @@ class FleetSimulator:
                         f"{list(route[-1])} instead of its dropoff "
                         f"{list(task.dropoff)}"
                     )
-                if (
-                    not task.picked_up
-                    and robot.position != task.pickup
-                    and task.pickup not in route
-                ):
+                if task.pickup in required and task.pickup not in route:
                     raise ValueError(
                         f"{label} has not picked up the goods and its remaining "
                         f"route never reaches the pickup point "
@@ -1481,9 +1507,7 @@ class FleetSimulator:
                         f"{list(robot.position)}, not at the dropoff "
                         f"{list(task.dropoff)}"
                     )
-            elif not (
-                robot.position == task.pickup == task.dropoff
-            ):
+            elif required:
                 raise ValueError(
                     f"{label} has an empty remaining route before pickup: the "
                     "task can only resume when the robot position, pickup "
