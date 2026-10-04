@@ -88,7 +88,11 @@ version is ``2``; version ``1`` files remain readable.
     List of ``{"robot_id": str, "blocked_by": [str, ...], "ticks": int}``
     entries recording how many consecutive ticks each robot has been held up
     purely by other robots. Absent in older files, which load with every
-    wait counter at zero.
+    wait counter at zero. Each entry must agree with the saved layout: the
+    robot needs a remaining route and ``blocked_by`` must name exactly the
+    robot occupying its next route cell -- a next cell nobody occupies, a
+    listed blocker parked elsewhere, or extra names beside the real blocker
+    all reject the document.
 
 Version 1 documents store tick frames without a ``type`` field and have no
 ``map_changes`` or ``base_grid`` key; they load with their grid taken as the
@@ -97,8 +101,9 @@ baseline, as if no map edit ever happened.
 Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
-mismatches, routes that cannot finish the robot's bound task, broken replay or
-map-change history, a completion history that contradicts the saved task
+mismatches, routes that cannot finish the robot's bound task, traffic waits
+that contradict the saved robot positions and remaining routes, broken replay
+or map-change history, a completion history that contradicts the saved task
 states, and a history that does not reproduce the saved grid all raise
 :class:`ValueError`.
 
@@ -1372,6 +1377,7 @@ class FleetSimulator:
         raw = data.get("traffic_waits", [])
         if not isinstance(raw, list):
             raise ValueError("checkpoint field 'traffic_waits' must be a list")
+        occupied = {robot.position: robot.robot_id for robot in robot_by_id.values()}
         waits: dict[str, dict[str, object]] = {}
         for index, entry in enumerate(raw):
             context = f"traffic wait entry {index}"
@@ -1408,6 +1414,26 @@ class FleetSimulator:
             if not robot_by_id[robot_id].route:
                 raise ValueError(
                     f"{context} robot {robot_id!r} has no remaining route to wait on"
+                )
+            # The record must reflect the saved layout: the robot's next route
+            # cell is held by exactly the robots named in 'blocked_by'. One
+            # cell holds at most one robot, so the list must name precisely
+            # the occupant of that cell -- a blocker parked elsewhere, an
+            # empty next cell, or extra names alongside the real blocker all
+            # make the whole checkpoint inconsistent.
+            next_cell = robot_by_id[robot_id].route[0]
+            occupant_id = occupied.get(next_cell)
+            if occupant_id is None:
+                raise ValueError(
+                    f"{context} robot {robot_id!r} is recorded as blocked by "
+                    f"{sorted(blocked_by)} but no robot occupies its next route "
+                    f"cell {list(next_cell)}"
+                )
+            if list(blocked_by) != [occupant_id]:
+                raise ValueError(
+                    f"{context} robot {robot_id!r} has its next route cell "
+                    f"{list(next_cell)} occupied by robot {occupant_id!r}, which "
+                    f"does not match the recorded blockers {sorted(blocked_by)}"
                 )
             waits[robot_id] = {"blocked_by": list(blocked_by), "ticks": ticks}
         return waits

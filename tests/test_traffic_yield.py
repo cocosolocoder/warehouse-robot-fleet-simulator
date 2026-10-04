@@ -521,6 +521,132 @@ class EndOfTickWaitTests(unittest.TestCase):
         self.assertEqual(sim.status()["traffic_waits"], [])
 
 
+class TrafficWaitRestoreTests(unittest.TestCase):
+    """Restored traffic waits must match the saved positions and routes."""
+
+    def build_document(self) -> dict:
+        # C idles at (0,0); A is loaded at (1,0) heading for its dropoff at
+        # (2,0), where idle B is parked. Saved at tick 0 with no replay.
+        sim = FleetSimulator(
+            GridMap(4, 1),
+            [
+                Robot("C", (0, 0)),
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state.json")
+            sim.save_checkpoint(path)
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+
+    def document_with_wait(self, blocked_by, ticks: int = 3) -> dict:
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": list(blocked_by), "ticks": ticks}
+        ]
+        return document
+
+    @staticmethod
+    def load_document(document: dict) -> FleetSimulator:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            return FleetSimulator.load_checkpoint(path)
+
+    def expect_rejected(self, document: dict, *fragments: str) -> None:
+        with self.assertRaises(ValueError) as context:
+            self.load_document(document)
+        for fragment in fragments:
+            self.assertIn(fragment, str(context.exception))
+
+    def test_consistent_wait_record_is_restored_verbatim(self) -> None:
+        sim = self.load_document(self.document_with_wait(["B"], ticks=3))
+        expected = [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}]
+        # Restoring neither advances the clock nor adds another waiting tick.
+        self.assertEqual(sim.tick, 0)
+        self.assertEqual(sim.status()["traffic_waits"], expected)
+        self.assertEqual(sim.metrics()["traffic_waits"], expected)
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(sim.robots["A"].distance_travelled, 0)
+
+    def test_wait_recorded_for_a_robot_elsewhere_is_rejected(self) -> None:
+        # C is part of the fleet but parked on (0,0), not on A's next cell.
+        document = self.document_with_wait(["C"])
+        self.expect_rejected(document, "'A'", "'B'", "[2, 0]")
+
+    def test_extra_blocker_besides_the_real_one_is_rejected(self) -> None:
+        document = self.document_with_wait(["B", "C"])
+        self.expect_rejected(document, "'A'", "'B'")
+
+    def test_wait_with_nobody_on_the_next_cell_is_rejected(self) -> None:
+        document = self.document_with_wait(["B"])
+        for record in document["robots"]:
+            if record["robot_id"] == "B":
+                record["position"] = [3, 0]
+        self.expect_rejected(document, "'A'", "no robot occupies")
+
+    def test_wait_without_remaining_route_is_still_rejected(self) -> None:
+        # Idle C has no route at all, so there is nothing it could wait on.
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "C", "blocked_by": ["A"], "ticks": 1}
+        ]
+        self.expect_rejected(document, "'C'", "no remaining route")
+
+    def test_legacy_file_without_traffic_waits_invents_no_records(self) -> None:
+        # B sits on A's next cell, but a v1 file carries no wait records and
+        # none may be fabricated for it on load.
+        document = self.build_document()
+        document["version"] = 1
+        for key in ("base_grid", "map_changes", "paused_tasks", "traffic_waits"):
+            document.pop(key, None)
+        sim = self.load_document(document)
+        self.assertEqual(sim.status()["traffic_waits"], [])
+        self.assertEqual(sim.metrics()["traffic_waits"], [])
+
+    def test_existing_shape_rejections_still_apply(self) -> None:
+        for blocked_by, ticks, fragment in (
+            (["NOPE"], 1, "unknown blocking robot"),
+            (["A"], 1, "cannot block itself"),
+            ([], 1, "non-empty list"),
+            (["B"], 0, "positive integer"),
+        ):
+            with self.subTest(blocked_by=blocked_by, ticks=ticks):
+                self.expect_rejected(
+                    self.document_with_wait(blocked_by, ticks), fragment
+                )
+        document = self.document_with_wait(["B"])
+        document["traffic_waits"].append(
+            {"robot_id": "A", "blocked_by": ["B"], "ticks": 1}
+        )
+        self.expect_rejected(document, "duplicate")
+
+    def test_real_wait_round_trip_keeps_blocker_and_count(self) -> None:
+        sim = FleetSimulator(
+            GridMap(3, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+            ],
+            [Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+        for _ in range(3):
+            sim.step()
+        before = sim.status()["traffic_waits"]
+        self.assertEqual(before, [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state.json")
+            sim.save_checkpoint(path)
+            loaded = FleetSimulator.load_checkpoint(path)
+        self.assertEqual(loaded.tick, sim.tick)
+        self.assertEqual(loaded.status()["traffic_waits"], before)
+        self.assertEqual(loaded.metrics()["traffic_waits"], before)
+
+
 class PausedRobotsDoNotYieldTests(unittest.TestCase):
     def test_paused_robot_stays_put_and_never_yields(self) -> None:
         # 5x1 corridor; R-2's dropoff gets sealed off so it pauses, and R-1
