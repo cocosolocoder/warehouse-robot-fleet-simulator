@@ -87,8 +87,14 @@ version is ``2``; version ``1`` files remain readable.
 ``traffic_waits`` (optional)
     List of ``{"robot_id": str, "blocked_by": [str, ...], "ticks": int}``
     entries recording how many consecutive ticks each robot has been held up
-    purely by other robots. Absent in older files, which load with every
-    wait counter at zero.
+    purely by other robots. Every entry must match the saved layout: its robot
+    must still have a remaining route and a bound, non-paused task, and
+    ``blocked_by`` must name exactly the robot occupying the entry's next
+    waypoint -- an empty next cell, a blocker standing elsewhere, or any extra
+    blocker invalidates the whole checkpoint. The blocker may be idle, busy, or
+    itself paused by map unreachability; occupying the cell is what counts.
+    Absent in older files, which load with every wait counter at zero even
+    when the saved layout visibly shows a blockage.
 
 Version 1 documents store tick frames without a ``type`` field and have no
 ``map_changes`` or ``base_grid`` key; they load with their grid taken as the
@@ -97,9 +103,10 @@ baseline, as if no map edit ever happened.
 Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
-mismatches, routes that cannot finish the robot's bound task, broken replay or
-map-change history, a completion history that contradicts the saved task
-states, and a history that does not reproduce the saved grid all raise
+mismatches, routes that cannot finish the robot's bound task, traffic wait
+records that do not match the saved positions and remaining routes, broken
+replay or map-change history, a completion history that contradicts the saved
+task states, and a history that does not reproduce the saved grid all raise
 :class:`ValueError`.
 
 A task-bound route is judged against the task's pickup state, not just for
@@ -1078,7 +1085,9 @@ class FleetSimulator:
 
         cls._validate_paused_state(paused, task_by_id, robot_by_id, grid)
         cls._validate_active_task_routes(paused, task_by_id, robot_by_id)
-        traffic_waits = cls._load_traffic_waits(data, robot_by_id)
+        traffic_waits = cls._load_traffic_waits(
+            data, robot_by_id, task_by_id, frozenset(paused)
+        )
 
         replay_change_frames = cls._replay_map_change_frames(replay)
         if replay_change_frames != map_changes:
@@ -1365,13 +1374,23 @@ class FleetSimulator:
 
     @classmethod
     def _load_traffic_waits(
-        cls, data: Mapping[str, object], robot_by_id: Mapping[str, Robot]
+        cls,
+        data: Mapping[str, object],
+        robot_by_id: Mapping[str, Robot],
+        task_by_id: Mapping[str, Task],
+        paused: frozenset[str],
     ) -> dict[str, dict[str, object]]:
         # Optional in every format version; older files simply lack the field
-        # and their robots start with zero recorded waits.
+        # and their robots start with zero recorded waits -- even a current
+        # blockage visible in the saved layout is not retroactively counted.
         raw = data.get("traffic_waits", [])
         if not isinstance(raw, list):
             raise ValueError("checkpoint field 'traffic_waits' must be a list")
+        # Judged strictly against the saved state: each listed robot's next
+        # saved waypoint must be held by exactly the listed blocker(s). The
+        # blocker being idle, busy, or paused on an unreachable task does not
+        # change that it physically occupies the cell.
+        occupied = {robot.position: robot.robot_id for robot in robot_by_id.values()}
         waits: dict[str, dict[str, object]] = {}
         for index, entry in enumerate(raw):
             context = f"traffic wait entry {index}"
@@ -1405,9 +1424,31 @@ class FleetSimulator:
             ticks = entry.get("ticks")
             if not _is_int(ticks) or ticks <= 0:
                 raise ValueError(f"{context} field 'ticks' must be a positive integer")
-            if not robot_by_id[robot_id].route:
+            robot = robot_by_id[robot_id]
+            task = task_by_id.get(robot.task_id) if robot.task_id is not None else None
+            if task is not None and task.task_id in paused:
+                raise ValueError(
+                    f"{context} robot {robot_id!r} is paused by map unreachability, "
+                    "not waiting on traffic"
+                )
+            if not robot.route:
                 raise ValueError(
                     f"{context} robot {robot_id!r} has no remaining route to wait on"
+                )
+            next_cell = robot.route[0]
+            occupant = occupied.get(next_cell)
+            actual = [occupant] if occupant is not None and occupant != robot_id else []
+            if set(blocked_by) != set(actual):
+                if occupant is None or occupant == robot_id:
+                    detail = f"its next waypoint {list(next_cell)} is unoccupied"
+                else:
+                    detail = (
+                        f"its next waypoint {list(next_cell)} is held by "
+                        f"{occupant!r}, not by {blocked_by!r}"
+                    )
+                raise ValueError(
+                    f"{context} for waiting robot {robot_id!r} does not match the "
+                    f"saved positions and remaining route: {detail}"
                 )
             waits[robot_id] = {"blocked_by": list(blocked_by), "ticks": ticks}
         return waits

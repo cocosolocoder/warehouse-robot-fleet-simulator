@@ -173,8 +173,14 @@ Checkpoints are UTF-8 encoded JSON. The top-level object contains:
   required point on the saved map.
 - `traffic_waits` — optional list of `{"robot_id", "blocked_by", "ticks"}`
   entries: robots currently held up by other robots, who blocks them, and for
-  how many consecutive ticks. Older files without this field load with every
-  counter at zero.
+  how many consecutive ticks. An entry is valid only while its robot still has
+  a remaining route (and a bound, non-map-paused task) and `blocked_by` names
+  exactly the robot occupying that route's next cell in the saved layout; an
+  empty next cell, a listed blocker standing elsewhere, or an extra robot in
+  the list invalidates the whole checkpoint. The blocker itself may be idle,
+  busy or map-paused — occupying the cell is what matters. Older files without
+  this field load with every counter at zero, even when the saved positions
+  visibly show a blockage.
 - `map_changes` — every actual edit in order, each
   `{"tick", "sequence", "added", "removed"}`; `sequence` runs from 1 and
   consecutive edits at the same `tick` preserve their order.
@@ -190,7 +196,9 @@ Loading validates the entire document: corrupted JSON, missing or wrongly
 typed fields, unsupported versions, duplicate robot or task ids, overlapping
 or out-of-bounds/blocked robot positions, routes that leave the map, cross
 obstacles, make non-adjacent moves, or cannot complete the robot's bound task,
-task/robot ownership mismatches, a broken replay history, out-of-bounds or
+task/robot ownership mismatches, traffic-wait records whose `blocked_by` list
+does not name exactly the robot holding the waiting robot's saved next cell,
+a broken replay history, out-of-bounds or
 add/remove-conflicting change records,
 a change history that does not reproduce the saved grid, and an inconsistent
 paused-task state are all rejected. So is a replay whose *history* could never

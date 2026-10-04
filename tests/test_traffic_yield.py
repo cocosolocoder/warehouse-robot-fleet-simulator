@@ -709,6 +709,205 @@ class TrafficWaitCheckpointTests(unittest.TestCase):
         )
 
 
+class TrafficWaitCheckpointConsistencyTests(unittest.TestCase):
+    """Restored waits must match the saved positions and remaining routes."""
+
+    def build_document(self) -> dict:
+        # A at (1,0) is delivering to (2,0); B holds (2,0); C is parked at
+        # (3,0), nowhere near A's next waypoint.
+        sim = FleetSimulator(
+            GridMap(4, 1),
+            [
+                Robot("A", (1, 0), route=[(2, 0)], task_id="T-1"),
+                Robot("B", (2, 0)),
+                Robot("C", (3, 0)),
+            ],
+            [Task("T-1", (1, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+        return json.loads(save_to_string(sim))
+
+    def load(self, document: dict) -> FleetSimulator:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            return FleetSimulator.load_checkpoint(path)
+
+    def expect_rejected(self, document: dict, *fragments: str) -> str:
+        with self.assertRaises(ValueError) as context:
+            self.load(document)
+        message = str(context.exception)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return message
+
+    def test_real_wait_restored_with_count_and_no_side_effects(self) -> None:
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["B"], "ticks": 4}
+        ]
+        loaded = self.load(document)
+        report = [{"robot_id": "A", "blocked_by": ["B"], "ticks": 4}]
+        self.assertEqual(loaded.status()["traffic_waits"], report)
+        self.assertEqual(loaded.metrics()["traffic_waits"], report)
+        # Restore neither advances the clock nor moves anything.
+        self.assertEqual(loaded.tick, document["tick"])
+        self.assertEqual(loaded.robots["A"].position, (1, 0))
+        self.assertEqual(loaded.robots["B"].position, (2, 0))
+        self.assertEqual(loaded.robots["C"].position, (3, 0))
+        self.assertEqual(loaded.robots["A"].distance_travelled, 0)
+
+    def test_blocker_standing_elsewhere_is_rejected(self) -> None:
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["C"], "ticks": 2}
+        ]
+        self.expect_rejected(
+            document, "traffic wait entry 0", "A", "next waypoint", "B", "C"
+        )
+
+    def test_extra_blocker_alongside_the_real_one_is_rejected(self) -> None:
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["B", "C"], "ticks": 2}
+        ]
+        self.expect_rejected(document, "A", "next waypoint", "B")
+
+    def test_unoccupied_next_waypoint_is_rejected(self) -> None:
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["B"], "ticks": 2}
+        ]
+        for robot in document["robots"]:
+            if robot["robot_id"] == "B":
+                robot["position"] = [0, 0]
+        self.expect_rejected(document, "A", "next waypoint", "unoccupied")
+
+    def test_blocker_activity_state_does_not_change_occupancy(self) -> None:
+        # The same record is valid whether the blocker is idle, busy, or
+        # itself paused by map unreachability.
+        def busy(document: dict) -> dict:
+            document["tasks"].append(
+                {
+                    "task_id": "T-2",
+                    "pickup": [2, 0],
+                    "dropoff": [3, 0],
+                    "assigned_robot": "B",
+                    "picked_up": True,
+                    "completed": False,
+                }
+            )
+            for robot in document["robots"]:
+                if robot["robot_id"] == "B":
+                    robot["task_id"] = "T-2"
+                    robot["route"] = [[3, 0]]
+            return document
+
+        def paused(document: dict) -> dict:
+            document["tasks"].append(
+                {
+                    "task_id": "T-2",
+                    "pickup": [9, 0],
+                    "dropoff": [9, 0],
+                    "assigned_robot": "B",
+                    "picked_up": False,
+                    "completed": False,
+                }
+            )
+            for robot in document["robots"]:
+                if robot["robot_id"] == "B":
+                    robot["task_id"] = "T-2"
+                    robot["route"] = []
+            document["paused_tasks"] = ["T-2"]
+            return document
+
+        for mutate in (lambda d: d, busy, paused):
+            with self.subTest(mutate=mutate.__name__):
+                document = self.build_document()
+                document["traffic_waits"] = [
+                    {"robot_id": "A", "blocked_by": ["B"], "ticks": 3}
+                ]
+                loaded = self.load(mutate(document))
+                self.assertEqual(
+                    loaded.status()["traffic_waits"],
+                    [{"robot_id": "A", "blocked_by": ["B"], "ticks": 3}],
+                )
+
+    def test_map_paused_waiter_is_rejected(self) -> None:
+        # A real pause: A's dropoff gets sealed off, clearing its route.
+        sim = FleetSimulator(
+            GridMap(3, 1),
+            [Robot("A", (0, 0)), Robot("B", (1, 0))],
+            [Task("T-1", (0, 0), (2, 0))],
+        )
+        sim.step()
+        sim.modify_obstacles(added=[(2, 0)])
+        self.assertEqual(sim.paused_tasks, {"T-1"})
+        document = json.loads(save_to_string(sim))
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["B"], "ticks": 1}
+        ]
+        self.expect_rejected(document, "A", "paused by map unreachability")
+
+    def test_relationship_is_judged_against_the_saved_route(self) -> None:
+        # Simulate a pre-save map change: A's saved route now steps to (0,0),
+        # which is free, while B still stands at (2,0). The stale wait on B
+        # must not be accepted on the strength of the old relationship.
+        document = self.build_document()
+        for robot in document["robots"]:
+            if robot["robot_id"] == "A":
+                robot["route"] = [[0, 0]]
+        document["tasks"][0]["dropoff"] = [0, 0]
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["B"], "ticks": 5}
+        ]
+        self.expect_rejected(document, "A", "next waypoint", "unoccupied")
+
+    def test_missing_field_is_never_filled_in_from_layout(self) -> None:
+        document = self.build_document()
+        document.pop("traffic_waits")
+        # B visibly occupies A's next cell, but no count may be invented.
+        loaded = self.load(document)
+        self.assertEqual(loaded.status()["traffic_waits"], [])
+        self.assertEqual(loaded.metrics()["traffic_waits"], [])
+
+        legacy = copy.deepcopy(document)
+        legacy["version"] = 1
+        for key in ("base_grid", "map_changes", "paused_tasks"):
+            legacy.pop(key, None)
+        legacy["replay"] = [
+            {key: value for key, value in frame.items() if key != "type"}
+            for frame in legacy["replay"]
+        ]
+        loaded_v1 = self.load(legacy)
+        self.assertEqual(loaded_v1.status()["traffic_waits"], [])
+        self.assertEqual(loaded_v1.metrics()["traffic_waits"], [])
+
+    def test_rejected_document_leaves_the_source_file_untouched(self) -> None:
+        document = self.build_document()
+        document["traffic_waits"] = [
+            {"robot_id": "A", "blocked_by": ["C"], "ticks": 2}
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            with open(path, encoding="utf-8") as handle:
+                original = handle.read()
+            with self.assertRaises(ValueError):
+                FleetSimulator.load_checkpoint(path)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), original)
+
+
+def save_to_string(simulator: FleetSimulator) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "state.json")
+        simulator.save_checkpoint(path)
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+
 class YieldDeterminismTests(unittest.TestCase):
     def test_input_list_order_does_not_change_results(self) -> None:
         first = swap_scenario()
