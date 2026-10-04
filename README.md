@@ -189,10 +189,25 @@ Checkpoints are UTF-8 encoded JSON. The top-level object contains:
 Loading validates the entire document: corrupted JSON, missing or wrongly
 typed fields, unsupported versions, duplicate robot or task ids, overlapping
 or out-of-bounds/blocked robot positions, routes that leave the map, cross
-obstacles, or make non-adjacent moves, task/robot ownership mismatches, a
-broken replay history, out-of-bounds or add/remove-conflicting change records,
-a change history that does not reproduce the saved grid, and an inconsistent
-paused-task state are all rejected. So is a replay whose *history* could never
+obstacles, or make non-adjacent moves, a remaining route that cannot finish
+the robot's bound task, task/robot ownership mismatches, a broken replay
+history, out-of-bounds or add/remove-conflicting change records, a change
+history that does not reproduce the saved grid, and an inconsistent
+paused-task state are all rejected. A remaining route is also judged against
+the task's current pickup state, not just the map: for an assigned,
+unfinished, non-paused task a non-empty route must end at the dropoff, and
+before pickup it must also pass the pickup point unless the robot is already
+standing on it (it collects on the next tick). A robot carrying goods only
+has to reach the dropoff — it is never sent back to a pickup cell that later
+closed — and passing the dropoff early is fine as long as goods are collected
+and the route finally returns there. An empty route is accepted only when the
+robot is already at the dropoff with goods aboard, or when pickup and
+dropoff are its current cell; tasks paused for map unreachability keep their
+empty route under the ordinary pause rules. Avoidance detours are allowed and
+need not match any particular replanned shortest path. Loading never repairs
+a bad route, flips a pickup flag or completes a task, and it never advances
+the tick, adds mileage, or confirms a pickup or delivery.
+ So is a replay whose *history* could never
 have happened, even when its final frame matches the saved robots: a robot out
 of bounds or on an obstacle that existed at that tick, two robots sharing a
 cell at a tick boundary, a jump of more than one orthogonal cell or a two-robot
