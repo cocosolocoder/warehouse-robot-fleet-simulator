@@ -68,6 +68,10 @@ version is ``2``; version ``1`` files remain readable.
     through ``tick`` and have the shape
     ``{"type": "tick", "tick": int, "moved": [robot_id, ...],
     "robots": {robot_id: [x, y], ...}, "completed": [task_id, ...]}``.
+    A tick event's ``completed`` is cumulative: it names every task finished
+    by the end of that tick, not just the ones finished during it, so a task
+    once listed stays listed in every later frame (in any order) and the
+    final tick event names exactly the tasks recorded as ``completed``.
     Map-change events sit between ticks (or after the last tick) and look like
     ``{"type": "map_change", "tick": int, "sequence": int,
     "added": [[x, y], ...], "removed": [[x, y], ...]}``. When ``tick`` is
@@ -94,7 +98,8 @@ Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
 mismatches, routes that cannot finish the robot's bound task, broken replay or
-map-change history, and a history that does not reproduce the saved grid all
+map-change history, a completion history that contradicts itself or the saved
+task states, and a history that does not reproduce the saved grid all
 raise :class:`ValueError`.
 
 A task-bound route is judged against the task's pickup state, not just for
@@ -122,6 +127,19 @@ robot may be recorded in a cell that is closed later, may not appear in a
 cell before it opens, and no change may add an obstacle onto a cell a tick
 frame shows occupied -- not even when a later change of the same tick removes
 it. Filesystem and permission failures propagate as :class:`OSError`.
+
+The recorded completion history is checked for consistency with itself and
+with the saved task states. Every tick frame's ``completed`` list must name
+known checkpoint tasks without repeating one within the frame, and because
+the list is cumulative a task recorded as completed may never vanish from a
+later frame -- not even when its robot has moved on to other work. The first
+frame has no recorded predecessor and may list completed tasks directly. When
+the checkpoint holds at least one tick frame, the final frame's completion
+set must equal exactly the tasks whose records say ``completed``; map-change
+events after the last tick carry no completion information and cannot alter
+that verdict. A checkpoint still at tick 0 has no frames to judge and loads
+with whatever its task records say, including tasks completed before any
+tick ran.
 """
 
 from __future__ import annotations
@@ -1057,6 +1075,7 @@ class FleetSimulator:
         # alongside the frames so each frame is judged against its contemporary
         # map.
         cls._validate_replay_positions(replay, tick, robot_by_id, base_grid, map_changes)
+        cls._validate_replay_completed(replay, task_by_id)
         return simulator
 
     @staticmethod
@@ -1790,3 +1809,77 @@ class FleetSimulator:
             # the cells the frame records the robots on.
             apply_changes(frame_tick, cells_seen)
             previous = positions
+
+    @classmethod
+    def _validate_replay_completed(
+        cls,
+        replay: Sequence[Mapping[str, object]],
+        task_by_id: Mapping[str, Task],
+    ) -> None:
+        """Reject completion histories that contradict themselves or the tasks.
+
+        A tick frame's ``completed`` list is cumulative: it names every task
+        finished by the end of that tick, so entries must reference checkpoint
+        tasks without repeating one within the frame, and a task once listed
+        must stay listed in every later frame -- a robot starting new work
+        never erases its finished deliveries. The first frame has no recorded
+        predecessor and may list completed tasks directly. When at least one
+        tick frame exists, the final frame's completion set must equal exactly
+        the tasks whose records say ``completed``; map-change events are not
+        tick frames and those sitting after the last tick cannot change that
+        verdict. A checkpoint still at tick 0 has no frames to judge and keeps
+        whatever completion state its task records carry.
+        """
+        known_ids = set(task_by_id)
+        recorded_completed = {
+            task.task_id for task in task_by_id.values() if task.completed
+        }
+        previous: set[str] = set()
+        last_tick: int | None = None
+        last_completed: set[str] = set()
+        for frame in replay:
+            if frame.get("type") != "tick":
+                continue
+            frame_tick = frame["tick"]
+            raw = frame["completed"]
+            assert isinstance(raw, list)
+            seen: set[str] = set()
+            for task_id in raw:
+                if task_id not in known_ids:
+                    raise ValueError(
+                        f"replay frame {frame_tick} 'completed' lists unknown task "
+                        f"{task_id!r}"
+                    )
+                if task_id in seen:
+                    raise ValueError(
+                        f"replay frame {frame_tick} 'completed' lists task "
+                        f"{task_id!r} more than once"
+                    )
+                seen.add(task_id)
+            dropped = previous - seen
+            if dropped:
+                task_id = sorted(dropped)[0]
+                raise ValueError(
+                    f"replay frame {frame_tick} 'completed' drops task {task_id!r} "
+                    "that an earlier frame recorded as completed"
+                )
+            previous = seen
+            last_tick = frame_tick
+            last_completed = seen
+        if last_tick is None or last_completed == recorded_completed:
+            return
+        missing = sorted(recorded_completed - last_completed)
+        extra = sorted(last_completed - recorded_completed)
+        details = []
+        if missing:
+            details.append(
+                f"tasks completed in the records but missing from the frame: {missing}"
+            )
+        if extra:
+            details.append(
+                f"tasks listed in the frame but not completed in the records: {extra}"
+            )
+        raise ValueError(
+            f"last replay tick frame {last_tick} 'completed' does not match the "
+            f"checkpoint task records ({'; '.join(details)})"
+        )
