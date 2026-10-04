@@ -139,7 +139,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
 from .model import GridMap, Position, Robot, Task
-from .pathfinding import shortest_path
+from .pathfinding import plan_task_route
 
 CHECKPOINT_VERSION = 2
 _LEGACY_VERSIONS = frozenset({1})
@@ -289,24 +289,12 @@ class FleetSimulator:
         """Shortest current->pickup->dropoff route, or None if unreachable.
 
         *start* overrides the robot's current position, which is how sidestep
-        candidates are evaluated without moving the robot first.
+        candidates are evaluated without moving the robot first. The
+        pickup/dropoff rule itself lives in :func:`plan_task_route` and is
+        shared by assignment, rerouting and checkpoint validation.
         """
         origin = robot.position if start is None else start
-        try:
-            if not task.picked_up:
-                if origin == task.pickup:
-                    to_pickup: list[Position] = []
-                else:
-                    to_pickup = shortest_path(self.grid, origin, task.pickup)
-                to_dropoff = shortest_path(self.grid, task.pickup, task.dropoff)
-            else:
-                # Goods are already on board: a reclosed pickup cell must not
-                # pull the robot back.
-                to_pickup = []
-                to_dropoff = shortest_path(self.grid, origin, task.dropoff)
-        except ValueError:
-            return None
-        return to_pickup + to_dropoff
+        return plan_task_route(self.grid, task, origin)
 
     def _reroute_after_map_change(self) -> None:
         for task in self.tasks.values():
@@ -636,10 +624,10 @@ class FleetSimulator:
             for robot in self.robots.values():
                 if not robot.idle:
                     continue
-                try:
-                    route = shortest_path(self.grid, robot.position, task.pickup)
-                    route += shortest_path(self.grid, task.pickup, task.dropoff)
-                except ValueError:
+                # Pending tasks are never picked up, so the shared rule plans
+                # the full current->pickup->dropoff route here.
+                route = plan_task_route(self.grid, task, robot.position)
+                if route is None:
                     continue
                 choices.append((len(route), robot.robot_id, route))
             if not choices:
@@ -1403,18 +1391,9 @@ class FleetSimulator:
                 )
             if grid is not None:
                 # A saved pause must reflect genuine unreachability on the
-                # saved map; otherwise the history is inconsistent.
-                reachable = True
-                try:
-                    if not task.picked_up:
-                        if owner.position != task.pickup:
-                            shortest_path(grid, owner.position, task.pickup)
-                        shortest_path(grid, task.pickup, task.dropoff)
-                    else:
-                        shortest_path(grid, owner.position, task.dropoff)
-                except ValueError:
-                    reachable = False
-                if reachable:
+                # saved map, judged by the same pickup/dropoff planning rule
+                # the runtime uses; otherwise the history is inconsistent.
+                if plan_task_route(grid, task, owner.position) is not None:
                     raise ValueError(
                         f"paused task {task_id!r} is actually reachable on the saved map"
                     )
