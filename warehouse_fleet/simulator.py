@@ -140,7 +140,7 @@ import copy
 import json
 import os
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 
 from .model import GridMap, Position, Robot, Task
@@ -398,6 +398,42 @@ class FleetSimulator:
                 cells.update(robot.route)
         return cells
 
+    def _safe_side_cells(
+        self,
+        robot: Robot,
+        occupied: Mapping[Position, str],
+        reserved: Mapping[Position, str],
+        forbidden: Iterable[Position] = (),
+    ) -> Iterator[Position]:
+        """Adjacent cells *robot* may actually side-step onto this tick.
+
+        The very same safety rule backs every side-step decision -- an idle
+        robot yielding for someone, a busy robot dodging a blocker itself, and
+        the hypothetical leave checks behind a retreat -- so the shared
+        conditions live exactly here. A cell qualifies only when it:
+
+        * lies inside the map with no obstacle (``GridMap.neighbors`` already
+          skips anything else),
+        * is held by no robot in the given (possibly hypothetical) layout,
+        * was not reserved by a move that already happened this tick,
+        * lies on no other robot's remaining route (the moving robot's own
+          route is excluded), and
+        * is not among *forbidden*: cells that are physically free but unsafe
+          for the caller's scenario, such as the requester's own cell (a
+          side-step there would swap the two robots within one tick) or the
+          retreating requester's replanned path (parking there only moves the
+          blockage onto a cell the requester must re-enter).
+
+        Neighbours are yielded in the deterministic ``GridMap.neighbors``
+        order (up, left, right, down); callers keep their own selection rules.
+        """
+        blocked = set(forbidden)
+        blocked.update(self._route_cells(exclude_id=robot.robot_id))
+        for cell in self.grid.neighbors(robot.position):
+            if cell in blocked or cell in occupied or cell in reserved:
+                continue
+            yield cell
+
     def _idle_sidestep_cell(
         self,
         blocker: Robot,
@@ -407,20 +443,17 @@ class FleetSimulator:
     ) -> Position | None:
         """Free side-cell an idle blocker can yield to, or None.
 
-        The target may not be the requester's own cell (that would swap the
-        two robots within one tick) nor any cell another robot still plans to
-        drive through, so the blocker never trades one blockage for another.
+        The requester's own cell is forbidden (yielding onto it would swap the
+        two robots within one tick); every other safety condition is shared via
+        :meth:`_safe_side_cells`, so the blocker never trades one blockage for
+        another. The first candidate in neighbour order wins.
         """
-        on_routes = self._route_cells(exclude_id=blocker.robot_id)
-        for cell in self.grid.neighbors(blocker.position):
-            if cell == requester.position:
-                continue
-            if cell in occupied or cell in reserved:
-                continue
-            if cell in on_routes:
-                continue
-            return cell
-        return None
+        return next(
+            self._safe_side_cells(
+                blocker, occupied, reserved, forbidden=(requester.position,)
+            ),
+            None,
+        )
 
     def _self_sidestep(
         self,
@@ -448,11 +481,12 @@ class FleetSimulator:
         blocker_id = occupied.get(destination)
         if blocker_id is None:
             blocker_id = reserved.get(destination)
-        on_routes = self._route_cells(exclude_id=robot.robot_id)
-        best: tuple[int, int, Position, list[Position]] | None = None
-        for index, cell in enumerate(self.grid.neighbors(robot.position)):
-            if cell in occupied or cell in reserved or cell in on_routes:
-                continue
+        best: tuple[Position, list[Position]] | None = None
+        best_length = 0
+        # Candidates arrive in neighbour order (up, left, right, down), so the
+        # first candidate of the minimum replanned length automatically keeps
+        # that order as the tie break.
+        for cell in self._safe_side_cells(robot, occupied, reserved):
             route = self._plan_route(robot, task, start=cell)
             if route is None:
                 continue
@@ -467,11 +501,10 @@ class FleetSimulator:
                 # robot is vacating and the blocker cannot use that opening to
                 # leave: the move would be undone on the next tick.
                 continue
-            if best is None or (len(route), index) < (best[0], best[1]):
-                best = (len(route), index, cell, route)
-        if best is None:
-            return None
-        return best[2], best[3]
+            if best is None or len(route) < best_length:
+                best = (cell, route)
+                best_length = len(route)
+        return best
 
     def _is_bounceback_retreat(
         self,
@@ -549,7 +582,11 @@ class FleetSimulator:
             # it never drives or sidesteps for anyone.
             return False
         if task is None:
-            # Idle robots only ever move by yielding for a requester.
+            # Idle robots only ever move by yielding for a requester, and they
+            # do so onto the first safe cell in neighbour order. When that
+            # particular cell sits on the path the retreating requester must
+            # re-enter, parking there only relocates the blockage instead of
+            # clearing it, so it does not count as leaving.
             side = self._idle_sidestep_cell(blocker, requester, occupied, reserved)
             return side is not None and side not in blocked_path
         if blocker.route:
@@ -578,16 +615,11 @@ class FleetSimulator:
                 ):
                     return True
         # Otherwise the blocker might sidestep onto a free side cell itself,
-        # but not onto a cell the retreating requester still has to use.
-        on_routes = self._route_cells(exclude_id=blocker.robot_id)
-        for side_cell in self.grid.neighbors(blocker.position):
-            if (
-                side_cell in occupied
-                or side_cell in reserved
-                or side_cell in on_routes
-                or side_cell in blocked_path
-            ):
-                continue
+        # but not onto a cell the retreating requester still has to use --
+        # parking there only moves the blockage.
+        for side_cell in self._safe_side_cells(
+            blocker, occupied, reserved, forbidden=blocked_path
+        ):
             if self._plan_route(blocker, task, start=side_cell) is not None:
                 return True
         return False
