@@ -93,8 +93,20 @@ baseline, as if no map edit ever happened.
 Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
-mismatches, broken replay or map-change history, and a history that does not
-reproduce the saved grid all raise :class:`ValueError`.
+mismatches, routes that cannot finish the robot's bound task, broken replay or
+map-change history, and a history that does not reproduce the saved grid all
+raise :class:`ValueError`.
+
+A task-bound route is judged against the task's pickup state, not just for
+walkability. For every assigned, unfinished task that is not paused by map
+unreachability, a non-empty remaining route must end at the dropoff, and when
+the goods are not yet collected and the robot is not already standing on the
+pickup cell, the route must still pass through that pickup cell -- passing the
+dropoff early changes nothing as long as the route later collects and returns,
+and avoidance detours need not match a replanned shortest route. An empty
+route is accepted only when a loaded robot already stands at the dropoff, or
+when position, pickup and dropoff all coincide; paused tasks keep their
+empty-route exemption, and unassigned or completed tasks are not checked.
 
 The recorded movement history is checked for physical plausibility, not just
 for a matching final frame. In every tick frame each robot must stand on a
@@ -1025,6 +1037,7 @@ class FleetSimulator:
                     )
 
         cls._validate_paused_state(paused, task_by_id, robot_by_id, grid)
+        cls._validate_active_task_routes(paused, task_by_id, robot_by_id)
         traffic_waits = cls._load_traffic_waits(data, robot_by_id)
 
         replay_change_frames = cls._replay_map_change_frames(replay)
@@ -1399,6 +1412,78 @@ class FleetSimulator:
                     raise ValueError(
                         f"paused task {task_id!r} is actually reachable on the saved map"
                     )
+
+    @staticmethod
+    def _validate_active_task_routes(
+        paused: set[str],
+        task_by_id: Mapping[str, Task],
+        robot_by_id: Mapping[str, Robot],
+    ) -> None:
+        """Reject routes that cannot finish the task each robot is bound to.
+
+        Traversability and adjacency are checked elsewhere. This enforces the
+        pickup/delivery business rules for tasks that are assigned, unfinished
+        and not paused by map unreachability: a non-empty route must end at the
+        dropoff, and a robot that has not collected yet -- and is not already
+        standing on the pickup cell -- must still pass through the pickup.
+        Passing the dropoff early changes nothing; the route only has to reach
+        the pickup first and return. Empty routes are legal only when the
+        loaded robot is already at the dropoff, or when position, pickup and
+        dropoff all coincide (the goods are collected on resume). Paused tasks
+        keep their empty-route exemption, and unassigned or completed tasks are
+        not judged as work in progress.
+        """
+        for task in task_by_id.values():
+            if task.completed or task.assigned_robot is None:
+                continue
+            if task.task_id in paused:
+                # Map-unreachability pauses legitimately carry an empty route
+                # regardless of pickup state; the binding itself is all that
+                # must survive.
+                continue
+            robot = robot_by_id.get(task.assigned_robot)
+            if robot is None or robot.task_id != task.task_id:
+                # Ownership mismatches of this kind are reported separately.
+                continue
+            route = robot.route
+            label = (
+                f"task {task.task_id!r} assigned to robot {robot.robot_id!r}"
+            )
+            if route:
+                if route[-1] != task.dropoff:
+                    raise ValueError(
+                        f"{label} has a remaining route that ends at "
+                        f"{list(route[-1])} instead of its dropoff "
+                        f"{list(task.dropoff)}"
+                    )
+                if (
+                    not task.picked_up
+                    and robot.position != task.pickup
+                    and task.pickup not in route
+                ):
+                    raise ValueError(
+                        f"{label} has not picked up the goods and its remaining "
+                        f"route never reaches the pickup point "
+                        f"{list(task.pickup)} on the way to its dropoff "
+                        f"{list(task.dropoff)}"
+                    )
+            elif task.picked_up:
+                if robot.position != task.dropoff:
+                    raise ValueError(
+                        f"{label} has an empty remaining route with the goods "
+                        f"already picked up but the robot is at "
+                        f"{list(robot.position)}, not at the dropoff "
+                        f"{list(task.dropoff)}"
+                    )
+            elif not (
+                robot.position == task.pickup == task.dropoff
+            ):
+                raise ValueError(
+                    f"{label} has an empty remaining route before pickup: the "
+                    "task can only resume when the robot position, pickup "
+                    f"{list(task.pickup)} and dropoff {list(task.dropoff)} all "
+                    "coincide"
+                )
 
     @classmethod
     def _load_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:

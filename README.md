@@ -189,8 +189,9 @@ Checkpoints are UTF-8 encoded JSON. The top-level object contains:
 Loading validates the entire document: corrupted JSON, missing or wrongly
 typed fields, unsupported versions, duplicate robot or task ids, overlapping
 or out-of-bounds/blocked robot positions, routes that leave the map, cross
-obstacles, or make non-adjacent moves, task/robot ownership mismatches, a
-broken replay history, out-of-bounds or add/remove-conflicting change records,
+obstacles, make non-adjacent moves, or cannot complete the robot's bound task,
+task/robot ownership mismatches, a broken replay history, out-of-bounds or
+add/remove-conflicting change records,
 a change history that does not reproduce the saved grid, and an inconsistent
 paused-task state are all rejected. So is a replay whose *history* could never
 have happened, even when its final frame matches the saved robots: a robot out
@@ -206,7 +207,15 @@ an edit may not add an obstacle onto a cell occupied when that tick ended —
 not even if another edit of the same tick removes it again. The first tick
 frame has no recorded predecessor, so its cells, overlaps and `moved` ids are
 still checked but the first moves are not second-guessed; zero-tick files,
-empty fleets and all-waiting frames remain valid. Version 1 documents contain
+empty fleets and all-waiting frames remain valid. Beyond physical
+plausibility, each assigned, unfinished, non-paused task must still be
+completable along its robot's remaining route: a non-empty route has to end at
+the dropoff, and a robot that has not collected yet — unless it is already
+standing on the pickup cell — must still pass through the pickup (visiting the
+dropoff early and leaving again is fine; detours need not match a replanned
+shortest path). An empty route is accepted only for a loaded robot already at
+the dropoff, or when position, pickup and dropoff all coincide; map-paused
+tasks keep their empty-route exemption. Version 1 documents contain
 tick frames without a `type` field and none of the edit-related keys; they
 load as if no map edit had ever happened.
 
