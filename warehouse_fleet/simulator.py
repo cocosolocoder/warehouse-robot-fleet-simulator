@@ -68,6 +68,10 @@ version is ``2``; version ``1`` files remain readable.
     through ``tick`` and have the shape
     ``{"type": "tick", "tick": int, "moved": [robot_id, ...],
     "robots": {robot_id: [x, y], ...}, "completed": [task_id, ...]}``.
+    ``completed`` is the cumulative set of tasks finished by the end of that
+    tick: entries must name checkpoint tasks without repeats within one frame,
+    a recorded completion must survive every later frame, and the final
+    frame's set must equal the tasks saved with ``completed: true``.
     Map-change events sit between ticks (or after the last tick) and look like
     ``{"type": "map_change", "tick": int, "sequence": int,
     "added": [[x, y], ...], "removed": [[x, y], ...]}``. When ``tick`` is
@@ -94,8 +98,9 @@ Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
 mismatches, routes that cannot finish the robot's bound task, broken replay or
-map-change history, and a history that does not reproduce the saved grid all
-raise :class:`ValueError`.
+map-change history, a completion history that contradicts the saved task
+states, and a history that does not reproduce the saved grid all raise
+:class:`ValueError`.
 
 A task-bound route is judged against the task's pickup state, not just for
 walkability. For every assigned, unfinished task that is not paused by map
@@ -1057,6 +1062,7 @@ class FleetSimulator:
         # alongside the frames so each frame is judged against its contemporary
         # map.
         cls._validate_replay_positions(replay, tick, robot_by_id, base_grid, map_changes)
+        cls._validate_replay_completion(replay, tick, task_by_id)
         return simulator
 
     @staticmethod
@@ -1790,3 +1796,78 @@ class FleetSimulator:
             # the cells the frame records the robots on.
             apply_changes(frame_tick, cells_seen)
             previous = positions
+
+    @classmethod
+    def _validate_replay_completion(
+        cls,
+        replay: Sequence[Mapping[str, object]],
+        tick: int,
+        task_by_id: Mapping[str, Task],
+    ) -> None:
+        """Reject completion histories that contradict the saved task states.
+
+        A tick frame's ``completed`` list is the cumulative set of tasks
+        finished by the end of that tick, not the tasks finished within it:
+        every entry must name a checkpoint task, no task may appear twice in
+        one frame, and a task once recorded must stay recorded in every later
+        frame -- a robot moving on to new work never erases the history. The
+        order inside a frame carries no meaning, and repeating the same task
+        across frames is the normal case. The last frame must therefore list
+        exactly the tasks saved as completed; anything else means the restored
+        completion count would differ from what the replay shows. Map-change
+        events are not time steps and take no part in this check, so edits
+        stamped after the final tick cannot excuse a mismatch. A checkpoint
+        still at tick 0 has no frames to judge: it loads as saved, completed
+        initial tasks included, and the first recorded frame may list
+        completions without any earlier empty frame.
+        """
+        known_ids = set(task_by_id)
+        previous: set[str] = set()
+        last_completed: set[str] | None = None
+        last_frame_tick = 0
+        for frame in replay:
+            if frame.get("type") != "tick":
+                continue
+            frame_tick = frame["tick"]
+            entries = frame["completed"]
+            assert isinstance(entries, list)
+            seen: set[str] = set()
+            for task_id in entries:
+                if task_id not in known_ids:
+                    raise ValueError(
+                        f"replay frame {frame_tick} lists unknown completed task "
+                        f"{task_id!r}"
+                    )
+                if task_id in seen:
+                    raise ValueError(
+                        f"replay frame {frame_tick} lists completed task "
+                        f"{task_id!r} more than once"
+                    )
+                seen.add(task_id)
+            dropped = previous - seen
+            if dropped:
+                task_id = sorted(dropped)[0]
+                raise ValueError(
+                    f"replay frame {frame_tick} drops task {task_id!r} from the "
+                    "completed list; a recorded completion must survive every "
+                    "later tick"
+                )
+            previous = seen
+            last_completed = seen
+            last_frame_tick = frame_tick
+
+        if tick == 0 or last_completed is None:
+            return
+        expected = {task.task_id for task in task_by_id.values() if task.completed}
+        if last_completed != expected:
+            missing = sorted(expected - last_completed)
+            extra = sorted(last_completed - expected)
+            details = []
+            if missing:
+                details.append(f"completed tasks missing from the frame: {missing}")
+            if extra:
+                details.append(f"tasks listed but saved as unfinished: {extra}")
+            raise ValueError(
+                f"last replay frame (tick {last_frame_tick}) completed tasks do "
+                f"not match the saved task states ({'; '.join(details)})"
+            )
