@@ -182,6 +182,146 @@ class InterruptedParityTests(unittest.TestCase):
             self.assertIsNot(first.replay, second.replay)
 
 
+class InitialOwnershipTests(unittest.TestCase):
+    """Direct construction must reject impossible task/robot bindings."""
+
+    def assert_rejected(self, robots, tasks, *fragments):
+        import copy
+
+        robots_before = copy.deepcopy(robots)
+        tasks_before = copy.deepcopy(tasks)
+        with self.assertRaises(ValueError) as context:
+            FleetSimulator(GridMap(8, 2), robots, tasks)
+        message = str(context.exception)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        # Rejecting a later record must not rewrite any caller object.
+        self.assertEqual(robots, robots_before)
+        self.assertEqual(tasks, tasks_before)
+        return message
+
+    def test_robot_executing_unknown_task_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0), task_id="NOPE")],
+            [Task("T1", (1, 0), (2, 0))],
+            "R1", "NOPE", "unknown task",
+        )
+
+    def test_robot_executing_completed_task_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0), task_id="T0")],
+            [Task("T0", (1, 0), (2, 0), assigned_robot="R1",
+                  picked_up=True, completed=True)],
+            "R1", "T0", "already completed",
+        )
+
+    def test_robot_executing_task_assigned_elsewhere_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0), task_id="T1"), Robot("R2", (7, 0))],
+            [Task("T1", (1, 0), (2, 0), assigned_robot="R2")],
+            "R1", "T1", "R2", "assigned to",
+        )
+
+    def test_task_assigned_to_unknown_robot_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0))],
+            [Task("T1", (1, 0), (2, 0), assigned_robot="NOPE")],
+            "T1", "NOPE", "unknown robot",
+        )
+
+    def test_task_claiming_robot_bound_elsewhere_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0), task_id="T1")],
+            [Task("T1", (1, 0), (2, 0), assigned_robot="R1"),
+             Task("T2", (3, 0), (4, 0), assigned_robot="R1")],
+            "T2", "R1", "T1",
+        )
+
+    def test_two_tasks_occupying_one_robot_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0), task_id="T1"),
+             Robot("R2", (7, 0), task_id="T2")],
+            [Task("T1", (1, 0), (2, 0), assigned_robot="R2"),
+             Task("T2", (3, 0), (4, 0), assigned_robot="R1")],
+            "R1", "T1",
+        )
+
+    def test_picked_up_task_without_executing_robot_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0))],
+            [Task("T1", (1, 0), (2, 0), picked_up=True)],
+            "T1", "picked up but has no assigned robot",
+        )
+        self.assert_rejected(
+            [Robot("R1", (0, 0))],
+            [Task("T1", (1, 0), (2, 0), assigned_robot="R1", picked_up=True)],
+            "T1", "R1",
+        )
+
+    def test_completed_task_that_was_never_picked_up_rejected(self) -> None:
+        self.assert_rejected(
+            [Robot("R1", (0, 0))],
+            [Task("T0", (1, 0), (2, 0), assigned_robot="R1", completed=True)],
+            "T0", "completed but never picked up",
+        )
+
+    def test_completed_history_with_robot_on_new_task_is_accepted(self) -> None:
+        simulator = FleetSimulator(
+            GridMap(8, 1),
+            [Robot("R", (0, 0), route=[(1, 0), (2, 0)], task_id="T1")],
+            [Task("T0", (1, 0), (2, 0), assigned_robot="R",
+                  picked_up=True, completed=True),
+             Task("T1", (1, 0), (2, 0), assigned_robot="R")],
+        )
+        self.assertEqual(simulator.robots["R"].task_id, "T1")
+        self.assertEqual(simulator.robots["R"].route, [(1, 0), (2, 0)])
+        self.assertTrue(simulator.tasks["T0"].completed)
+        self.assertEqual(simulator.tasks["T0"].assigned_robot, "R")
+        self.assertFalse(simulator.tasks["T1"].completed)
+
+    def test_completed_history_with_idle_robot_is_accepted(self) -> None:
+        simulator = FleetSimulator(
+            GridMap(8, 1),
+            [Robot("R", (0, 0))],
+            [Task("T0", (1, 0), (2, 0), assigned_robot="R",
+                  picked_up=True, completed=True)],
+        )
+        self.assertTrue(simulator.robots["R"].idle)
+        self.assertTrue(simulator.tasks["T0"].completed)
+
+    def test_unassigned_task_and_idle_robots_are_accepted(self) -> None:
+        simulator = FleetSimulator(
+            GridMap(8, 1),
+            [Robot("R", (0, 0))],
+            [Task("T1", (1, 0), (2, 0))],
+        )
+        self.assertTrue(simulator.robots["R"].idle)
+        self.assertIsNone(simulator.tasks["T1"].assigned_robot)
+
+    def test_unreachable_unassigned_task_keeps_waiting(self) -> None:
+        grid = GridMap(3, 3, frozenset({(1, 0), (1, 1), (1, 2)}))
+        simulator = FleetSimulator(
+            grid, [Robot("R", (0, 0))], [Task("T1", (2, 0), (2, 2))]
+        )
+        simulator.assign_tasks()
+        self.assertIsNone(simulator.tasks["T1"].assigned_robot)
+        self.assertTrue(simulator.robots["R"].idle)
+        self.assertEqual(simulator.paused_tasks, set())
+
+    def test_legal_binding_route_and_state_are_preserved_without_a_tick(self) -> None:
+        robot = Robot("R", (1, 0), route=[(2, 0), (3, 0)], task_id="T1")
+        task = Task("T1", (1, 0), (3, 0), assigned_robot="R", picked_up=True)
+        simulator = FleetSimulator(GridMap(4, 1), [robot], [task])
+        self.assertEqual(simulator.tick, 0)
+        self.assertEqual(simulator.replay, [])
+        self.assertEqual(simulator.robots["R"].position, (1, 0))
+        self.assertEqual(simulator.robots["R"].route, [(2, 0), (3, 0)])
+        self.assertEqual(simulator.robots["R"].task_id, "T1")
+        self.assertTrue(simulator.tasks["T1"].picked_up)
+        self.assertFalse(simulator.tasks["T1"].completed)
+        self.assertEqual(simulator.robots["R"].distance_travelled, 0)
+
+
 class CheckpointFormatTests(unittest.TestCase):
     def setUp(self) -> None:
         simulator = run_until_done(demo_scenario(), 4)
