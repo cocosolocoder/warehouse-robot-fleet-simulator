@@ -76,7 +76,12 @@ first waypoint equal to the current position are all rejected, and waypoints
 must be two plain integers (never booleans) in a list or tuple, with wrong
 lengths or element types raising :class:`ValueError` rather than leaking
 unpacking or hashing errors. Empty routes stay legal; a route need not be
-shortest and may revisit cells. A route crossing another robot's current cell,
+shortest and may revisit cells. The remaining route itself may be a list or a
+tuple and its waypoint pairs may be lists or tuples (even mixed within one
+route); every accepted route is stored in one canonical internal form after
+the whole fleet validates, so the supplied form never changes execution, and
+the caller's own containers are never modified in place. A route crossing
+another robot's current cell,
 or several robots planning through the same cell, is not an error -- those
 traffic conflicts are settled during execution. The direct interface keeps
 its existing acceptance of a bound route's pickup/dropoff ordering and end
@@ -293,6 +298,27 @@ class FleetSimulator:
             raise ValueError("robot starts outside traversable map space")
         self._validate_task_ownership(robots, tasks)
         self._validate_initial_routes(grid, robots)
+        # Only reached once every robot passed validation: adopt the accepted
+        # routes in the one internal form execution requires (see below).
+        self._canonicalize_routes(robots)
+
+    @staticmethod
+    def _canonicalize_routes(robots: Sequence[Robot]) -> None:
+        """Store accepted routes as a mutable list of hashable cell tuples.
+
+        Construction accepts the remaining route as a list *or* tuple whose
+        waypoints may themselves be lists or tuples. Execution, however, pops
+        the consumed head off the container and uses every cell as a dict/set
+        key, so a tuple route or a list coordinate would fail only once the
+        robot first moves -- after its position and mileage were already
+        changed, leaving a half-applied step. The fleet as a whole is accepted
+        only after every route validates, so the conversion happens here rather
+        than during the read-only check: a rejected fleet never reaches this
+        point, and a rebinding (never an in-place mutation) leaves the caller's
+        own list or tuple and its coordinate objects untouched.
+        """
+        for robot in robots:
+            robot.route = [(cell[0], cell[1]) for cell in robot.route]
 
     @staticmethod
     def _validate_task_ownership(robots: Sequence[Robot], tasks: Sequence[Task]) -> None:
@@ -381,10 +407,13 @@ class FleetSimulator:
         Routes need not be shortest paths and may revisit cells, and traffic
         (a route crossing another robot's cell, or routes sharing a cell) is
         left to execution: only walkability on the given map is judged. The
-        check is read-only -- a rejected fleet is rejected as a whole, and the
-        caller's robot and task objects are never truncated, padded, reordered
-        or otherwise modified. Checkpoint loading keeps its own, stricter
-        validation that also covers the task pickup/dropoff rules.
+        check itself is read-only -- a rejected fleet is rejected as a whole,
+        and the caller's robot and task objects are never truncated, padded,
+        reordered or otherwise modified. A fleet that passes is normalized
+        afterwards by :meth:`_canonicalize_routes`, so the accepted list/tuple
+        outer containers and list/tuple waypoint pairs all execute identically.
+        Checkpoint loading keeps its own, stricter validation that also covers
+        the task pickup/dropoff rules.
         """
         for robot in robots:
             route = robot.route
