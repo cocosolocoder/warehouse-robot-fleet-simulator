@@ -73,12 +73,19 @@ routes, replay and statistics.
 ## Automatic yielding in traffic
 
 When a robot's next waypoint is occupied by another robot, `step()` no longer
-just waits: an idle blocker is asked to step onto a free neighbouring cell
-that lies on no robot's planned route, and a busy robot whose blocker cannot
-drive on may sidestep onto a free adjacent cell itself and replan its
-(still shortest) route from there. Every robot still moves at most one
-orthogonal cell per tick (or waits), robots never share a cell at the end of
-a tick, never swap places within one tick, and never enter an obstacle.
+just waits: a parked blocker — one with no bound task *and* no remaining
+route — is asked to step onto a free neighbouring cell that lies on no
+robot's planned route, and a busy robot whose blocker cannot drive on may
+sidestep onto a free adjacent cell itself and replan its (still shortest)
+route from there. A taskless robot that still carries a remaining route is
+not parked: it drives that route cell by cell just like a task-bound robot,
+is never pushed off it for another robot, and when its own next cell is
+occupied it simply stays put with its unconsumed waypoints — an open side
+cell changes nothing. Only once that route is finished does it become a
+parked robot that yields by the side-cell rule. Every robot still moves at
+most one orthogonal cell per tick (or waits), robots never share a cell at
+the end of a tick, never swap places within one tick, and never enter an
+obstacle.
 
 A sidestep that cannot make progress is not taken. If the replanned route
 steps straight back through the cell the robot is vacating, still runs past
