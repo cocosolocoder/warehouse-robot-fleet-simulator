@@ -149,6 +149,15 @@ Version 1 documents store tick frames without a ``type`` field and have no
 ``map_changes`` or ``base_grid`` key; they load with their grid taken as the
 baseline, as if no map edit ever happened.
 
+Both map definitions are validated by the single shared
+:meth:`FleetSimulator._load_map_definition` rule -- positive integer
+dimensions, an obstacle list of integer ``[x, y]`` pairs inside the map --
+with wording that names the map at fault, so a format or value rule is
+maintained in exactly one place while each map keeps its own contents. The
+cross-definition constraints (matching dimensions and a history that replays
+``base_grid`` onto ``grid``) are checked separately and remain distinct
+rejection reasons from a malformed definition.
+
 Loading performs strict validation: malformed JSON, missing or wrongly typed
 fields, unsupported versions, duplicate or inconsistent entities, out of
 bounds/obstructed positions and routes, non-adjacent route steps, ownership
@@ -1476,53 +1485,75 @@ class FleetSimulator:
 
     @classmethod
     def _load_grid(cls, data: Mapping[str, object]) -> GridMap:
-        raw = cls._require_field(data, "grid")
-        if not isinstance(raw, dict):
-            raise ValueError("checkpoint field 'grid' must be an object")
-        width = raw.get("width")
-        height = raw.get("height")
-        if not _is_int(width) or width <= 0:
-            raise ValueError("checkpoint grid width must be a positive integer")
-        if not _is_int(height) or height <= 0:
-            raise ValueError("checkpoint grid height must be a positive integer")
-        raw_obstacles = raw.get("obstacles")
-        if not isinstance(raw_obstacles, list):
-            raise ValueError("checkpoint grid 'obstacles' must be a list")
-        obstacles: set[tuple[int, int]] = set()
-        for index, cell in enumerate(raw_obstacles):
-            obstacle = _as_pair(cell, f"obstacle entry {index}")
-            if not (0 <= obstacle[0] < width and 0 <= obstacle[1] < height):
-                raise ValueError(f"obstacle {list(obstacle)} lies outside the map")
-            obstacles.add(obstacle)
-        try:
-            return GridMap(width, height, frozenset(obstacles))
-        except ValueError as exc:
-            raise ValueError(f"invalid checkpoint grid: {exc}") from exc
+        return cls._load_map_definition(
+            data, "grid", map_label="grid", obstacle_label="obstacle"
+        )
 
     @classmethod
     def _load_base_grid(cls, data: Mapping[str, object]) -> GridMap:
-        raw = cls._require_field(data, "base_grid")
+        return cls._load_map_definition(
+            data, "base_grid", map_label="base grid", obstacle_label="base obstacle"
+        )
+
+    @classmethod
+    def _load_map_definition(
+        cls,
+        data: Mapping[str, object],
+        field_name: str,
+        *,
+        map_label: str,
+        obstacle_label: str,
+    ) -> GridMap:
+        """Validate one checkpoint map definition and build its grid.
+
+        This is the single place that owns the map-definition rule shared by
+        the current ``grid`` and the version 2 ``base_grid``, so a format or
+        value rule never has to be changed in two places: the field must be an
+        object with positive integer ``width``/``height`` (booleans are not
+        integers) and an ``obstacles`` list of ``[x, y]`` integer pairs, each
+        lying inside its own map. An empty obstacle list is legal, and a
+        coordinate repeated within the list denotes a single obstacle. Nothing
+        is coerced -- strings, floats and booleans are rejected, never
+        converted -- and the file-format judgement is not relaxed just because
+        a grid could be built from the values.
+
+        The two definitions are validated independently and keep their own
+        contents: neither map is ever copied from the other. Only the wording
+        differs between the two entry points, via *map_label* (``grid`` /
+        ``base grid``) and *obstacle_label* (``obstacle`` / ``base obstacle``),
+        so an error still names the map and the exact dimension or obstacle
+        entry at fault. Cross-definition rules -- matching dimensions and a
+        history that replays the base grid onto the current one -- are checked
+        separately afterwards and stay distinct rejection reasons.
+        """
+        raw = cls._require_field(data, field_name)
         if not isinstance(raw, dict):
-            raise ValueError("checkpoint field 'base_grid' must be an object")
+            raise ValueError(f"checkpoint field {field_name!r} must be an object")
         width = raw.get("width")
         height = raw.get("height")
         if not _is_int(width) or width <= 0:
-            raise ValueError("checkpoint base grid width must be a positive integer")
+            raise ValueError(
+                f"checkpoint {map_label} width must be a positive integer"
+            )
         if not _is_int(height) or height <= 0:
-            raise ValueError("checkpoint base grid height must be a positive integer")
+            raise ValueError(
+                f"checkpoint {map_label} height must be a positive integer"
+            )
         raw_obstacles = raw.get("obstacles")
         if not isinstance(raw_obstacles, list):
-            raise ValueError("checkpoint base grid 'obstacles' must be a list")
+            raise ValueError(f"checkpoint {map_label} 'obstacles' must be a list")
         obstacles: set[tuple[int, int]] = set()
         for index, cell in enumerate(raw_obstacles):
-            obstacle = _as_pair(cell, f"base obstacle entry {index}")
+            obstacle = _as_pair(cell, f"{obstacle_label} entry {index}")
             if not (0 <= obstacle[0] < width and 0 <= obstacle[1] < height):
-                raise ValueError(f"base obstacle {list(obstacle)} lies outside the map")
+                raise ValueError(
+                    f"{obstacle_label} {list(obstacle)} lies outside the map"
+                )
             obstacles.add(obstacle)
         try:
             return GridMap(width, height, frozenset(obstacles))
         except ValueError as exc:
-            raise ValueError(f"invalid checkpoint base grid: {exc}") from exc
+            raise ValueError(f"invalid checkpoint {map_label}: {exc}") from exc
 
     @classmethod
     def _load_tick(cls, data: Mapping[str, object]) -> int:
