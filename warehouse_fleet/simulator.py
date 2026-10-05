@@ -59,6 +59,16 @@ or task involved; nothing is rebound, unassigned or dropped, and the caller's
 objects are left untouched. The same unfinished-task binding rules govern
 checkpoint loading (which additionally keeps its historical-state checks).
 
+A robot's declared remaining route is validated just as strictly at
+construction: every waypoint must be a two-integer coordinate inside the map
+and off every obstacle, and the route must walk from the robot's current
+position in single orthogonal steps -- jumps, diagonal moves, repeated cells
+and malformed coordinates raise :class:`ValueError` naming the robot and the
+offending waypoint or segment. The check applies to every robot with a
+route, bound to a task or not; empty routes are always legal, and routes
+crossing cells other robots occupy or plan to visit are traffic conflicts
+for execution to resolve, not construction errors.
+
 Checkpoint file format
 ----------------------
 ``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current format
@@ -267,6 +277,43 @@ class FleetSimulator:
         if any(not grid.traversable(position) for position in positions):
             raise ValueError("robot starts outside traversable map space")
         self._validate_task_ownership(robots, tasks)
+        self._validate_initial_routes(robots, grid)
+
+    @staticmethod
+    def _validate_initial_routes(robots: Sequence[Robot], grid: GridMap) -> None:
+        """Reject remaining routes that cannot be walked cell by cell.
+
+        Every robot that carries a route is checked, whether or not it is
+        currently bound to a task: the route describes physical driving, so a
+        jump would otherwise be recorded as a single one-mile move. A
+        non-empty route must start one orthogonal step away from the robot's
+        current position and continue in single orthogonal steps; every
+        waypoint must be a plain two-integer coordinate (booleans are not
+        integers) lying inside the map and off every obstacle. Diagonal moves,
+        multi-cell jumps, a repeated cell and the robot's own position as the
+        first waypoint are all rejected, as are malformed coordinates --
+        nothing is truncated, padded or reordered to make an input fit, and
+        the caller's robots are left untouched. Empty routes stay legal, and
+        cells other robots occupy or plan to visit are not a construction
+        error: those traffic conflicts are resolved while stepping.
+        """
+        for robot in robots:
+            previous = robot.position
+            for index, cell in enumerate(robot.route):
+                waypoint = _as_cell(
+                    cell, f"robot {robot.robot_id!r} route entry {index}"
+                )
+                if not grid.traversable(waypoint):
+                    raise ValueError(
+                        f"robot {robot.robot_id!r} route entry {list(waypoint)} is "
+                        "outside the map or inside an obstacle"
+                    )
+                if abs(waypoint[0] - previous[0]) + abs(waypoint[1] - previous[1]) != 1:
+                    raise ValueError(
+                        f"robot {robot.robot_id!r} route moves non-adjacently from "
+                        f"{list(previous)} to {list(waypoint)}"
+                    )
+                previous = waypoint
 
     @staticmethod
     def _validate_task_ownership(robots: Sequence[Robot], tasks: Sequence[Task]) -> None:
