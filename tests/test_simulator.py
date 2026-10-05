@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import subprocess
@@ -5,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from warehouse_fleet import FleetSimulator, GridMap, Robot, Task, shortest_path
 
@@ -26,6 +28,23 @@ def run_until_done(simulator: FleetSimulator, limit: int = 30) -> FleetSimulator
         metrics = simulator.metrics()
         if metrics["tasks_completed"] == metrics["tasks_total"]:
             break
+    return simulator
+
+
+def mid_delivery_scenario(steps: int = 2) -> FleetSimulator:
+    """A run where both robots carry picked-up but undelivered cargo.
+
+    The two robots drive on separate rows so no traffic interaction can
+    interfere; after *steps* ticks both tasks are claimed and loaded, neither
+    is completed, and the replay holds one frame per tick.
+    """
+    simulator = FleetSimulator(
+        GridMap(6, 2),
+        [Robot("R-1", (0, 0)), Robot("R-2", (5, 1))],
+        [Task("T-1", (1, 0), (5, 0)), Task("T-2", (4, 1), (0, 1))],
+    )
+    for _ in range(steps):
+        simulator.step()
     return simulator
 
 
@@ -376,6 +395,151 @@ class AtomicSaveTests(unittest.TestCase):
             loaded = FleetSimulator.load_checkpoint(path)
             self.assertEqual(loaded.tick, 1)
             self.assertEqual(loaded.snapshot(), simulator.snapshot())
+
+
+class _PartialWrite:
+    """File proxy that stores only part of the payload, then fails the write.
+
+    Stands in for a filesystem error that strikes after the new checkpoint
+    content has started flowing to disk but before it is complete.
+    """
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+
+    def write(self, data: bytes) -> int:
+        self._handle.write(data[: max(1, len(data) // 3)])
+        raise OSError("simulated write failure")
+
+    def __getattr__(self, name: str):
+        return getattr(self._handle, name)
+
+
+class AtomicSaveFailureTests(unittest.TestCase):
+    """Failures after a save has started must not corrupt the destination."""
+
+    @staticmethod
+    def _failure_patchers() -> dict[str, object]:
+        """One factory per failure point between temp creation and replace."""
+        real_fdopen = os.fdopen
+
+        def partial_fdopen(fd, mode, *args, **kwargs):
+            return _PartialWrite(real_fdopen(fd, mode, *args, **kwargs))
+
+        return {
+            # The write itself dies partway through the payload.
+            "write": lambda: mock.patch("os.fdopen", new=partial_fdopen),
+            # Content is written but syncing it to disk fails pre-replace.
+            "sync": lambda: mock.patch(
+                "os.fsync", side_effect=OSError("simulated sync failure")
+            ),
+            # New content is fully on disk but the atomic replace fails.
+            "replace": lambda: mock.patch(
+                "os.replace", side_effect=OSError("simulated replace failure")
+            ),
+        }
+
+    def _assert_mid_delivery(self, simulator: FleetSimulator, tick: int) -> None:
+        # The saved state carries business meaning: both tasks are claimed
+        # and their cargo loaded, yet neither delivery has completed.
+        self.assertEqual(simulator.tick, tick)
+        for task_id in ("T-1", "T-2"):
+            task = simulator.tasks[task_id]
+            self.assertIsNotNone(task.assigned_robot)
+            self.assertTrue(task.picked_up)
+            self.assertFalse(task.completed)
+        self.assertEqual(len(simulator.replay), tick)
+
+    def _assert_state_unchanged(self, simulator: FleetSimulator, before: dict) -> None:
+        # One snapshot covers everything a failed save must not touch: the
+        # clock, robot positions, remaining routes, task claim/load/completion
+        # flags, the replay and the recorded metrics.
+        self.assertEqual(simulator.snapshot(), before)
+
+    def test_failed_save_preserves_existing_checkpoint(self) -> None:
+        for name, make_patcher in self._failure_patchers().items():
+            with self.subTest(failure=name):
+                self._check_existing_target_preserved(make_patcher)
+
+    def test_failed_save_to_new_target_leaves_nothing(self) -> None:
+        for name, make_patcher in self._failure_patchers().items():
+            with self.subTest(failure=name):
+                self._check_new_target_left_absent(make_patcher)
+
+    def _check_existing_target_preserved(self, make_patcher) -> None:
+        simulator = mid_delivery_scenario(steps=2)
+        self._assert_mid_delivery(simulator, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            simulator.save_checkpoint(path)
+            old_bytes = Path(path).read_bytes()
+            # snapshot() aliases the live replay list, so freeze a deep copy
+            # before the clock advances.
+            old_snapshot = copy.deepcopy(simulator.snapshot())
+
+            # Advance so the pending save clearly differs from the old file.
+            simulator.step()
+            simulator.step()
+            self._assert_mid_delivery(simulator, 4)
+            self.assertNotEqual(simulator.snapshot(), old_snapshot)
+
+            unrelated = os.path.join(tmp, "unrelated.txt")
+            Path(unrelated).write_text("keep me", encoding="utf-8")
+
+            before = copy.deepcopy(simulator.snapshot())
+            with make_patcher():
+                with self.assertRaises(OSError):
+                    simulator.save_checkpoint(path)
+            self._assert_state_unchanged(simulator, before)
+
+            # The destination keeps the old checkpoint byte for byte, and
+            # reading it back yields the old progress with nothing of the
+            # pending state (positions, tasks, replay) mixed in.
+            self.assertEqual(Path(path).read_bytes(), old_bytes)
+            loaded = FleetSimulator.load_checkpoint(path)
+            self.assertEqual(loaded.snapshot(), old_snapshot)
+            self.assertEqual(loaded.tick, 2)
+            self.assertNotEqual(loaded.robots["R-1"].position, simulator.robots["R-1"].position)
+            self.assertEqual(len(loaded.replay), 2)
+
+            # No half-written temp file survives; unrelated files are intact.
+            self.assertEqual(sorted(os.listdir(tmp)), ["state.json", "unrelated.txt"])
+            self.assertEqual(Path(unrelated).read_text(encoding="utf-8"), "keep me")
+
+            # Once the error clears the same simulator saves successfully:
+            # the old file is fully superseded by a readable new checkpoint.
+            simulator.save_checkpoint(path)
+            self.assertNotEqual(Path(path).read_bytes(), old_bytes)
+            recovered = FleetSimulator.load_checkpoint(path)
+            self.assertEqual(recovered.snapshot(), simulator.snapshot())
+            self.assertEqual(recovered.tick, 4)
+
+    def _check_new_target_left_absent(self, make_patcher) -> None:
+        simulator = mid_delivery_scenario(steps=2)
+        self._assert_mid_delivery(simulator, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            unrelated = os.path.join(tmp, "unrelated.txt")
+            Path(unrelated).write_text("keep me", encoding="utf-8")
+            path = os.path.join(tmp, "state.json")
+
+            before = copy.deepcopy(simulator.snapshot())
+            with make_patcher():
+                with self.assertRaises(OSError):
+                    simulator.save_checkpoint(path)
+            self._assert_state_unchanged(simulator, before)
+
+            # The target stays absent, the temp file is cleaned up and the
+            # unrelated neighbour is untouched.
+            self.assertFalse(os.path.exists(path))
+            self.assertEqual(os.listdir(tmp), ["unrelated.txt"])
+            self.assertEqual(Path(unrelated).read_text(encoding="utf-8"), "keep me")
+
+            # After the error clears the same simulator saves successfully
+            # and the fresh checkpoint loads back the same progress.
+            simulator.save_checkpoint(path)
+            recovered = FleetSimulator.load_checkpoint(path)
+            self.assertEqual(recovered.snapshot(), simulator.snapshot())
+            self.assertEqual(recovered.tick, 2)
 
 
 class CommandLineTests(unittest.TestCase):
