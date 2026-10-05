@@ -924,12 +924,25 @@ class FleetSimulator:
     # ------------------------------------------------------------------
 
     def assign_tasks(self) -> None:
-        """Assign pending tasks to the nearest idle robot using stable tie breaks."""
+        """Assign pending tasks to the nearest available robot.
+
+        A robot is available only when it has no bound task *and* no
+        remaining route: a taskless robot still driving a preset route keeps
+        that route untouched and never takes new work early, even when it is
+        the closest to the pickup -- or already standing on it. Skipping it
+        leaves its position, mileage and cargo state alone, and the remaining
+        eligible robots are still ranked by actual feasible route length with
+        the robot id string breaking ties, so one temporarily unavailable
+        robot never stalls the whole fleet. A robot whose route is merely
+        blocked by traffic is still driving that route -- waiting is not
+        completion -- and only an exhausted route makes it a candidate again
+        at the next assignment pass.
+        """
         pending = [task for task in self.tasks.values() if task.assigned_robot is None]
         for task in sorted(pending, key=lambda item: item.task_id):
             choices: list[tuple[int, str, list[tuple[int, int]]]] = []
             for robot in self.robots.values():
-                if not robot.idle:
+                if not robot.idle or robot.route:
                     continue
                 route = _plan_task_route(self.grid, robot.position, task)
                 if route is None:
