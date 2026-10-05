@@ -72,7 +72,9 @@ objects are left untouched. The same unfinished-task binding rules govern
 checkpoint loading (which additionally keeps its historical-state checks).
 
 Every robot's remaining route is also validated as a walk on the given map,
-whether or not the robot is bound to a task. The route omits the robot's
+whether or not the robot is bound to a task, and direct construction and
+checkpoint recovery run the *same* :func:`_validate_route_walk` check, so the
+walking rule is maintained in exactly one place. The route omits the robot's
 current cell, so a non-empty route must begin with an up/down/left/right
 neighbour of that cell and every later waypoint must be one orthogonal step
 from the previous one; each waypoint must be in bounds and free of obstacles.
@@ -205,25 +207,51 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _as_cell(value: object, description: str) -> Position:
-    """Validate a user supplied coordinate as a two-integer pair."""
-    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
-        raise ValueError(f"{description} must be a [x, y] integer pair")
-    if len(value) != 2:
-        raise ValueError(f"{description} must be a [x, y] integer pair")
-    if not all(_is_int(coord) for coord in value):
-        raise ValueError(f"{description} coordinates must be integers, not booleans or other types")
+def _coordinate_pair(value: object, description: str, *, strict_list: bool) -> Position:
+    """Validate *value* as a pair of two plain integers.
+
+    Booleans are rejected even though they are Python ints, and wrong lengths
+    or element types raise :class:`ValueError` instead of leaking unpacking or
+    hashing errors. This is the one coordinate-shape rule shared by every
+    caller; the two entry points only differ in the outer container spellings
+    they accept:
+
+    * strict JSON lists only (*strict_list* true, checkpoints, whose document
+      shape is fixed and must not be relaxed because validation is shared);
+    * lists or tuples alike (*strict_list* false, the direct Python interface,
+      where the two spellings may be mixed freely).
+    """
+    if strict_list:
+        # Checkpoints keep their single, fixed message for every shape problem
+        # -- wrong type, wrong length or a non-integer (including a boolean) --
+        # because the JSON document shape is fixed and shared validation must
+        # not change what a malformed checkpoint reports.
+        if (
+            not isinstance(value, list)
+            or len(value) != 2
+            or not all(_is_int(coord) for coord in value)
+        ):
+            raise ValueError(f"{description} must be a [x, y] integer pair")
+    else:
+        if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+            raise ValueError(f"{description} must be a [x, y] integer pair")
+        if len(value) != 2:
+            raise ValueError(f"{description} must be a [x, y] integer pair")
+        if not all(_is_int(coord) for coord in value):
+            raise ValueError(
+                f"{description} coordinates must be integers, not booleans or other types"
+            )
     return value[0], value[1]
+
+
+def _as_cell(value: object, description: str) -> Position:
+    """Validate a user supplied coordinate as a two-integer list or tuple."""
+    return _coordinate_pair(value, description, strict_list=False)
 
 
 def _as_pair(value: object, description: str) -> tuple[int, int]:
-    if (
-        not isinstance(value, list)
-        or len(value) != 2
-        or not all(_is_int(coord) for coord in value)
-    ):
-        raise ValueError(f"{description} must be a [x, y] integer pair")
-    return value[0], value[1]
+    """Validate a checkpoint coordinate as a two-integer JSON list."""
+    return _coordinate_pair(value, description, strict_list=True)
 
 
 def _task_route_waypoints(origin: Position, task: Task) -> list[Position]:
@@ -273,6 +301,113 @@ def _plan_task_route(
         route.extend(leg)
         current = waypoint
     return route
+
+
+def _validate_route_walk(
+    grid: GridMap,
+    origin: Position,
+    route: Sequence[object],
+    *,
+    robot_id: str,
+    checkpoint: bool,
+) -> list[Position]:
+    """Validate one robot's remaining route as a cell-by-cell map walk.
+
+    This is the single place that owns the walking rule shared by direct
+    fleet construction and checkpoint recovery, so the same legality check is
+    never edited twice. A route holds the cells still ahead of *origin*:
+
+    * every waypoint must parse as two plain integers (booleans are rejected),
+      lie inside the map and outside its obstacles;
+    * the first waypoint must be an up/down/left/right neighbour of *origin*,
+      so a first waypoint equal to the current cell is rejected;
+    * every later waypoint must be exactly one orthogonal step from the
+      previous one -- diagonal moves, multi-cell jumps and two identical
+      consecutive waypoints are all rejected.
+
+    Detours and revisits (including *origin*) are legal, and a route crossing
+    another robot's cell is never a walk error: traffic is settled while
+    stepping, not here. The walkability rule deliberately says nothing about
+    the bound task's pickup/dropoff requirements; checkpoint loading keeps
+    that separate, stricter business check. The result is a fresh mutable list
+    of tuple cells, so validating never aliases or mutates the caller's
+    container and a rejected input leaves every earlier object untouched.
+
+    The two entries keep their existing format and wording differences via
+    *checkpoint*: direct construction (false) accepts a list or tuple route of
+    list-or-tuple cells and reports ``route waypoint N`` with a dedicated
+    message for a first waypoint on the current cell and for repeated
+    consecutive waypoints; checkpoint loading (true) keeps the strict JSON
+    list-of-lists format (``_as_pair``), says ``route entry`` and folds both
+    equal-cell cases into its existing non-adjacency message. The checks
+    performed are identical either way.
+    """
+    waypoints: list[Position] = []
+    previous = origin
+    for index, cell in enumerate(route):
+        if checkpoint:
+            waypoint = _as_pair(
+                cell, f"robot {robot_id!r} route entry {index}"
+            )
+        else:
+            waypoint = _as_cell(
+                cell, f"robot {robot_id!r} route waypoint {index}"
+            )
+        if not grid.traversable(waypoint):
+            if checkpoint:
+                raise ValueError(
+                    f"robot {robot_id!r} route entry {list(waypoint)} is "
+                    "outside the map or inside an obstacle"
+                )
+            raise ValueError(
+                f"robot {robot_id!r} route waypoint {index} "
+                f"{list(waypoint)} is outside the map or inside an obstacle"
+            )
+        if waypoint == previous:
+            if checkpoint:
+                # The checkpoint wording treats an equal cell like any other
+                # non-adjacent step, naming both cells of the offending move.
+                raise ValueError(
+                    f"robot {robot_id!r} route moves non-adjacently from "
+                    f"{list(previous)} to {list(waypoint)}"
+                )
+            if index == 0:
+                raise ValueError(
+                    f"robot {robot_id!r} route waypoint 0 {list(waypoint)} "
+                    "is the robot's current cell; the remaining route must "
+                    "start with the next cell"
+                )
+            raise ValueError(
+                f"robot {robot_id!r} route repeats cell {list(waypoint)} at "
+                f"consecutive waypoints {index - 1} and {index}"
+            )
+        if (
+            abs(waypoint[0] - previous[0])
+            + abs(waypoint[1] - previous[1])
+            != 1
+        ):
+            if checkpoint:
+                raise ValueError(
+                    f"robot {robot_id!r} route moves non-adjacently from "
+                    f"{list(previous)} to {list(waypoint)}"
+                )
+            if index == 0:
+                segment = (
+                    f"from its current position {list(previous)} to route "
+                    f"waypoint 0 {list(waypoint)}"
+                )
+            else:
+                segment = (
+                    f"from route waypoint {index - 1} {list(previous)} to "
+                    f"waypoint {index} {list(waypoint)}"
+                )
+            raise ValueError(
+                f"robot {robot_id!r} route moves non-adjacently {segment}: "
+                "every step must move one orthogonal cell"
+            )
+        waypoints.append(waypoint)
+        previous = waypoint
+    return waypoints
 
 
 class FleetSimulator:
@@ -381,18 +516,15 @@ class FleetSimulator:
     ) -> list[list[Position]]:
         """Validate every remaining route and return normalized copies.
 
-        Every robot is checked, idle or task-bound: a route carries no current
-        cell, so a non-empty route must begin with an orthogonal neighbour of
-        the robot's position and every later waypoint must be one orthogonal
-        step from the previous one. Diagonal moves, multi-cell jumps, two
-        identical consecutive waypoints and a first waypoint equal to the
-        current cell are all rejected, and every waypoint must lie inside the
-        map and outside its obstacles. The outer route may be a list or tuple
-        and each waypoint may itself be a list or tuple of two plain integers
-        -- booleans are not integers here, and wrong lengths or element types
-        raise :class:`ValueError` instead of leaking unpacking or hashing
-        failures. The forms may be mixed freely; only the coordinate order
-        matters, not the container types.
+        Every robot is checked, idle or task-bound, via the single shared walk
+        validator :func:`_validate_route_walk` -- the same coordinate shape,
+        map-walkability and one-orthogonal-step rule checkpoint recovery uses
+        -- so a walking rule never has to be changed in two places. The outer
+        route may be a list or tuple and each waypoint may itself be a list or
+        tuple of two plain integers -- booleans are not integers here, and
+        wrong lengths or element types raise :class:`ValueError` instead of
+        leaking unpacking or hashing failures. The forms may be mixed freely;
+        only the coordinate order matters, not the container types.
 
         Accepted routes are returned as mutable lists of tuple cells, the one
         shape the rest of the engine relies on (head consumption with
@@ -402,13 +534,14 @@ class FleetSimulator:
         another robot's cell, or routes sharing a cell) is left to execution:
         only walkability on the given map is judged.
 
-        The check is read-only -- normalization happens on fresh lists, and
-        the caller commits them itself only once every robot has passed, so a
-        rejected fleet is rejected as a whole: an error on a later robot or at
-        the end of a route never truncates, pads, reorders or otherwise
-        modifies an earlier robot or any caller object. Checkpoint loading
-        keeps its own, stricter validation that also covers the task
-        pickup/dropoff rules.
+        The check is read-only -- :func:`_validate_route_walk` builds fresh
+        lists, and the caller commits them itself only once every robot has
+        passed, so a rejected fleet is rejected as a whole: an error on a
+        later robot or at the end of a route never truncates, pads, reorders
+        or otherwise modifies an earlier robot or any caller object. The
+        shared walk check says nothing about tasks; direct construction keeps
+        accepting any walkable route, while checkpoint loading keeps its own
+        stricter validation that also covers the pickup/dropoff rules.
         """
         normalized: list[list[Position]] = []
         for robot in robots:
@@ -418,51 +551,15 @@ class FleetSimulator:
                     f"robot {robot.robot_id!r} remaining route must be a list "
                     "of [x, y] waypoints"
                 )
-            waypoints: list[Position] = []
-            previous = robot.position
-            for index, cell in enumerate(route):
-                waypoint = _as_cell(
-                    cell, f"robot {robot.robot_id!r} route waypoint {index}"
+            normalized.append(
+                _validate_route_walk(
+                    grid,
+                    robot.position,
+                    route,
+                    robot_id=robot.robot_id,
+                    checkpoint=False,
                 )
-                if not grid.traversable(waypoint):
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} route waypoint {index} "
-                        f"{list(waypoint)} is outside the map or inside an obstacle"
-                    )
-                if index == 0 and waypoint == previous:
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} route waypoint 0 "
-                        f"{list(waypoint)} is the robot's current cell; the "
-                        "remaining route must start with the next cell"
-                    )
-                if waypoint == previous:
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} route repeats cell "
-                        f"{list(waypoint)} at consecutive waypoints "
-                        f"{index - 1} and {index}"
-                    )
-                if (
-                    abs(waypoint[0] - previous[0])
-                    + abs(waypoint[1] - previous[1])
-                    != 1
-                ):
-                    if index == 0:
-                        segment = (
-                            f"from its current position {list(previous)} to "
-                            f"route waypoint 0 {list(waypoint)}"
-                        )
-                    else:
-                        segment = (
-                            f"from route waypoint {index - 1} {list(previous)} "
-                            f"to waypoint {index} {list(waypoint)}"
-                        )
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} route moves non-adjacently "
-                        f"{segment}: every step must move one orthogonal cell"
-                    )
-                waypoints.append(waypoint)
-                previous = waypoint
-            normalized.append(waypoints)
+            )
         return normalized
 
     # ------------------------------------------------------------------
@@ -1269,24 +1366,17 @@ class FleetSimulator:
                     f"robot {record['robot_id']!r} position {list(position)} is outside "
                     "the map or inside an obstacle"
                 )
-            route: list[tuple[int, int]] = []
-            previous = position
-            for index, cell in enumerate(record["route"]):
-                waypoint = _as_pair(
-                    cell, f"robot {record['robot_id']!r} route entry {index}"
-                )
-                if not grid.traversable(waypoint):
-                    raise ValueError(
-                        f"robot {record['robot_id']!r} route entry {list(waypoint)} is "
-                        "outside the map or inside an obstacle"
-                    )
-                if abs(waypoint[0] - previous[0]) + abs(waypoint[1] - previous[1]) != 1:
-                    raise ValueError(
-                        f"robot {record['robot_id']!r} route moves non-adjacently from "
-                        f"{list(previous)} to {list(waypoint)}"
-                    )
-                route.append(waypoint)
-                previous = waypoint
+            # Walkability uses the very same shared cell-by-cell rule as
+            # direct construction (strict JSON list format and checkpoint
+            # wording preserved); the task pickup/dropoff rules are a separate
+            # check below.
+            route: list[tuple[int, int]] = _validate_route_walk(
+                grid,
+                position,
+                record["route"],
+                robot_id=record["robot_id"],
+                checkpoint=True,
+            )
             distance = record["distance_travelled"]
             if not _is_int(distance) or distance < 0:
                 raise ValueError(
