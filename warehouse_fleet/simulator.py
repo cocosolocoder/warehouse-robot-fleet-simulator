@@ -292,7 +292,14 @@ class FleetSimulator:
         if any(not grid.traversable(position) for position in positions):
             raise ValueError("robot starts outside traversable map space")
         self._validate_task_ownership(robots, tasks)
-        self._validate_initial_routes(grid, robots)
+        # Accepted routes share one internal shape regardless of how the caller
+        # spelled them: a mutable list of tuple cells. The normalized copies are
+        # committed only after every robot passed validation, so a rejection
+        # (even one buried in a later robot's route) never touches the caller's
+        # objects. See :meth:`_normalize_initial_routes`.
+        normalized_routes = self._normalize_initial_routes(grid, robots)
+        for robot, route in zip(robots, normalized_routes):
+            robot.route = route
 
     @staticmethod
     def _validate_task_ownership(robots: Sequence[Robot], tasks: Sequence[Task]) -> None:
@@ -364,8 +371,10 @@ class FleetSimulator:
                     )
 
     @staticmethod
-    def _validate_initial_routes(grid: GridMap, robots: Sequence[Robot]) -> None:
-        """Reject remaining routes that cannot be walked cell by cell.
+    def _normalize_initial_routes(
+        grid: GridMap, robots: Sequence[Robot]
+    ) -> list[list[Position]]:
+        """Validate every remaining route and return normalized copies.
 
         Every robot is checked, idle or task-bound: a route carries no current
         cell, so a non-empty route must begin with an orthogonal neighbour of
@@ -373,19 +382,30 @@ class FleetSimulator:
         step from the previous one. Diagonal moves, multi-cell jumps, two
         identical consecutive waypoints and a first waypoint equal to the
         current cell are all rejected, and every waypoint must lie inside the
-        map and outside its obstacles. Waypoints must be two plain integers in
-        a list or tuple -- booleans are not integers here, and wrong lengths or
-        element types raise :class:`ValueError` instead of leaking unpacking or
-        hashing failures.
+        map and outside its obstacles. The outer route may be a list or tuple
+        and each waypoint may itself be a list or tuple of two plain integers
+        -- booleans are not integers here, and wrong lengths or element types
+        raise :class:`ValueError` instead of leaking unpacking or hashing
+        failures. The forms may be mixed freely; only the coordinate order
+        matters, not the container types.
 
-        Routes need not be shortest paths and may revisit cells, and traffic
-        (a route crossing another robot's cell, or routes sharing a cell) is
-        left to execution: only walkability on the given map is judged. The
-        check is read-only -- a rejected fleet is rejected as a whole, and the
-        caller's robot and task objects are never truncated, padded, reordered
-        or otherwise modified. Checkpoint loading keeps its own, stricter
-        validation that also covers the task pickup/dropoff rules.
+        Accepted routes are returned as mutable lists of tuple cells, the one
+        shape the rest of the engine relies on (head consumption with
+        ``pop(0)`` and hashable cells for road and occupancy checks). Empty
+        lists and tuples both normalize to an empty route. Routes need not be
+        shortest paths and may revisit cells, and traffic (a route crossing
+        another robot's cell, or routes sharing a cell) is left to execution:
+        only walkability on the given map is judged.
+
+        The check is read-only -- normalization happens on fresh lists, and
+        the caller commits them itself only once every robot has passed, so a
+        rejected fleet is rejected as a whole: an error on a later robot or at
+        the end of a route never truncates, pads, reorders or otherwise
+        modifies an earlier robot or any caller object. Checkpoint loading
+        keeps its own, stricter validation that also covers the task
+        pickup/dropoff rules.
         """
+        normalized: list[list[Position]] = []
         for robot in robots:
             route = robot.route
             if not isinstance(route, (list, tuple)):
@@ -393,6 +413,7 @@ class FleetSimulator:
                     f"robot {robot.robot_id!r} remaining route must be a list "
                     "of [x, y] waypoints"
                 )
+            waypoints: list[Position] = []
             previous = robot.position
             for index, cell in enumerate(route):
                 waypoint = _as_cell(
@@ -434,7 +455,10 @@ class FleetSimulator:
                         f"robot {robot.robot_id!r} route moves non-adjacently "
                         f"{segment}: every step must move one orthogonal cell"
                     )
+                waypoints.append(waypoint)
                 previous = waypoint
+            normalized.append(waypoints)
+        return normalized
 
     # ------------------------------------------------------------------
     # Dynamic map edits

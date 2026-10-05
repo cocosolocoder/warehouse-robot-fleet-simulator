@@ -292,5 +292,120 @@ class LegalRouteAcceptanceTests(unittest.TestCase):
         self.assertEqual(loaded.robots["A"].route, [(2, 0), (3, 0)])
 
 
+class RouteContainerFormTests(unittest.TestCase):
+    """Accepted input spellings: list/tuple outer route, list/tuple cells.
+
+    Every accepted form must execute identically -- the same cells in the same
+    order, one consumed waypoint and one mileage unit per tick, one replay
+    frame per tick -- because the engine only knows a mutable list of tuple
+    cells after construction. The caller's own route object is never mutated
+    or aliased, and creation itself neither drives nor records time.
+    """
+
+    ROUTE = ((1, 0), (2, 0), (2, 1))
+
+    def _forms(self):
+        cells = self.ROUTE
+        return {
+            "list of lists": [[x, y] for x, y in cells],
+            "list of tuples": [tuple(cell) for cell in cells],
+            "tuple of tuples": tuple(cells),
+            "tuple of lists": tuple([x, y] for x, y in cells),
+            "mixed containers": [cells[0], tuple(cells[1]), list(cells[2])],
+        }
+
+    def test_every_form_constructs_without_driving_or_recording(self) -> None:
+        for form, route in self._forms().items():
+            with self.subTest(form=form):
+                simulator = make_sim([Robot("R-1", (0, 0), route=copy.deepcopy(route))])
+                robot = simulator.robots["R-1"]
+                # Construction normalizes the stored route but never drives.
+                self.assertEqual(robot.route, list(self.ROUTE))
+                self.assertIsInstance(robot.route, list)
+                self.assertTrue(all(isinstance(cell, tuple) for cell in robot.route))
+                self.assertEqual(robot.position, (0, 0))
+                self.assertEqual(robot.distance_travelled, 0)
+                self.assertEqual(simulator.tick, 0)
+                self.assertEqual(simulator.replay, [])
+
+    def test_every_form_reaches_the_end_in_three_ticks(self) -> None:
+        expected_positions = [(1, 0), (2, 0), (2, 1)]
+        expected_routes = [
+            [(2, 0), (2, 1)],
+            [(2, 1)],
+            [],
+        ]
+        for form, route in self._forms().items():
+            with self.subTest(form=form):
+                simulator = make_sim([Robot("R-1", (0, 0), route=copy.deepcopy(route))])
+                for tick, (position, remaining) in enumerate(
+                    zip(expected_positions, expected_routes), start=1
+                ):
+                    event = simulator.step()
+                    robot = simulator.robots["R-1"]
+                    self.assertEqual(event["moved"], ["R-1"])
+                    self.assertEqual(robot.position, tuple(position))
+                    self.assertEqual(robot.route, remaining)
+                    self.assertEqual(robot.distance_travelled, tick)
+                    self.assertEqual(event["robots"]["R-1"], list(position))
+                self.assertEqual(simulator.tick, 3)
+                self.assertEqual(len(simulator.replay), 3)
+
+    def test_every_form_behaves_identically_when_task_bound(self) -> None:
+        for form, route in self._forms().items():
+            with self.subTest(form=form):
+                simulator = make_sim(
+                    [Robot("R-1", (0, 0), route=copy.deepcopy(route), task_id="T-1")],
+                    [Task("T-1", (2, 0), (2, 1), assigned_robot="R-1")],
+                )
+                task = simulator.tasks["T-1"]
+                simulator.step()
+                self.assertFalse(task.picked_up)
+                simulator.step()
+                self.assertTrue(task.picked_up)
+                self.assertFalse(task.completed)
+                event = simulator.step()
+                self.assertTrue(task.completed)
+                self.assertIsNone(simulator.robots["R-1"].task_id)
+                self.assertEqual(event["completed"], ["T-1"])
+
+    def test_empty_tuple_is_the_same_empty_route_as_empty_list(self) -> None:
+        for empty in ([], ()):
+            with self.subTest(empty=empty):
+                simulator = make_sim([Robot("R-1", (0, 0), route=empty)])
+                self.assertEqual(simulator.robots["R-1"].route, [])
+                event = simulator.step()
+                self.assertEqual(event["moved"], [])
+                self.assertEqual(simulator.robots["R-1"].distance_travelled, 0)
+
+    def test_successful_construction_does_not_mutate_or_alias_callers_route(self) -> None:
+        caller_route = [[1, 0], (2, 0), [2, 1]]
+        stored_form = copy.deepcopy(caller_route)
+        simulator = make_sim([Robot("R-1", (0, 0), route=caller_route)])
+        self.assertEqual(caller_route, stored_form)
+        # Driving the normalized copy must not touch the caller's object.
+        simulator.step()
+        self.assertEqual(caller_route, stored_form)
+        self.assertIsNot(simulator.robots["R-1"].route, caller_route)
+
+    def test_waiting_consumes_no_tuple_route_or_mileage(self) -> None:
+        # A tuple route blocked by a parked robot: the wait keeps the whole
+        # route and adds no mileage; once the blocker yields, the route pops
+        # normally instead of failing on tuple.pop.
+        simulator = FleetSimulator(
+            GridMap(3, 2),
+            [
+                Robot("A", (0, 0), route=((1, 0), (2, 0))),
+                Robot("P", (1, 0)),
+            ],
+            [],
+        )
+        event = simulator.step()
+        self.assertEqual(event["moved"], ["P", "A"])
+        self.assertEqual(simulator.robots["A"].position, (1, 0))
+        self.assertEqual(simulator.robots["A"].route, [(2, 0)])
+        self.assertEqual(simulator.robots["A"].distance_travelled, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
