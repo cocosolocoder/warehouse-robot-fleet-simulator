@@ -40,6 +40,25 @@ longer facing its recorded blocker on the replanned route loses its entry, an
 entry still facing the same blocker keeps its count, and no edit ever creates
 or increments one.
 
+Initial task ownership
+----------------------
+A fleet can be created mid-work: a robot may already name its current task
+with a remaining route, and a task may already be assigned or even loaded.
+Construction validates these bindings up front instead of discovering them
+while stepping. Every robot that names a task must name one that exists, is
+still unfinished and is assigned back to that robot; every unfinished task
+that names an owner must name an existing robot whose current task it is, and
+a task with the goods collected may never lack that owner. One robot is
+therefore never claimed by two unfinished tasks, and a robot may never be
+bound to a completed task. Finished tasks only retain *historical* ownership:
+their recorded robot need not be idle or name them back, may already work a
+new task, and may even be absent from the fleet. Unassigned, not-yet-collected
+tasks simply wait -- including ones no robot can currently reach -- and are
+not an ownership error. Conflicts raise :class:`ValueError` naming the robot
+or task involved; nothing is rebound, unassigned or dropped, and the caller's
+objects are left untouched. The same unfinished-task binding rules govern
+checkpoint loading (which additionally keeps its historical-state checks).
+
 Checkpoint file format
 ----------------------
 ``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current format
@@ -247,6 +266,76 @@ class FleetSimulator:
             raise ValueError("robots cannot share an initial position")
         if any(not grid.traversable(position) for position in positions):
             raise ValueError("robot starts outside traversable map space")
+        self._validate_task_ownership(robots, tasks)
+
+    @staticmethod
+    def _validate_task_ownership(robots: Sequence[Robot], tasks: Sequence[Task]) -> None:
+        """Reject impossible initial bindings between robots and tasks.
+
+        The very same mutual-ownership requirement backs direct construction
+        and checkpoint loading, so it lives in exactly one place. The binding
+        only governs work still in progress:
+
+        * A robot that declares a task must name a task that exists, is not
+          completed yet, and is assigned back to that same robot.
+        * An unfinished task that names an owner must name an existing robot
+          whose current task it is; an unfinished task with the goods already
+          collected additionally must have an owner.
+        * A robot can therefore never be claimed by two unfinished tasks: the
+          second task's owner points at a robot that executes another task.
+
+        Completed tasks only keep *historical* ownership: their recorded
+        ``assigned_robot`` is not required to be idle or to name them back, so
+        a robot that already finished one task may be idle or busy with a new
+        one. Unassigned, not-yet-collected tasks simply wait -- even when no
+        robot can reach them -- and are not an ownership error. Nothing here
+        rewrites a binding or drops a task; an inconsistent input is rejected
+        as a whole with a :class:`ValueError` naming the conflicting robot or
+        task, leaving the caller's objects untouched.
+        """
+        robot_by_id = {robot.robot_id: robot for robot in robots}
+        task_by_id = {task.task_id: task for task in tasks}
+        for robot in robots:
+            if robot.task_id is None:
+                continue
+            task = task_by_id.get(robot.task_id)
+            if task is None:
+                raise ValueError(
+                    f"robot {robot.robot_id!r} executes unknown task "
+                    f"{robot.task_id!r}"
+                )
+            if task.completed:
+                raise ValueError(
+                    f"robot {robot.robot_id!r} executes task {task.task_id!r} "
+                    "that is already completed"
+                )
+            if task.assigned_robot != robot.robot_id:
+                raise ValueError(
+                    f"robot {robot.robot_id!r} executes task {task.task_id!r} "
+                    f"but the task is assigned to {task.assigned_robot!r}"
+                )
+        for task in tasks:
+            # Completed tasks retain historical ownership; their robots are
+            # free to take new work, so the mutual binding only holds while a
+            # task is still in progress.
+            if task.completed:
+                continue
+            if task.picked_up and task.assigned_robot is None:
+                raise ValueError(
+                    f"task {task.task_id!r} is picked up but has no assigned robot"
+                )
+            if task.assigned_robot is not None:
+                owner = robot_by_id.get(task.assigned_robot)
+                if owner is None:
+                    raise ValueError(
+                        f"task {task.task_id!r} is assigned to unknown robot "
+                        f"{task.assigned_robot!r}"
+                    )
+                if owner.task_id != task.task_id:
+                    raise ValueError(
+                        f"task {task.task_id!r} claims robot {owner.robot_id!r} "
+                        f"but the robot executes {owner.task_id!r}"
+                    )
 
     # ------------------------------------------------------------------
     # Dynamic map edits
@@ -1073,45 +1162,23 @@ class FleetSimulator:
         robot_by_id = {robot.robot_id: robot for robot in robots}
         task_by_id = {task.task_id: task for task in tasks}
 
-        for robot in robots:
-            if robot.task_id is not None:
-                task = task_by_id.get(robot.task_id)
-                if task is None:
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} executes unknown task {robot.task_id!r}"
-                    )
-                if task.completed:
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} executes task {task.task_id!r} that is "
-                        "already completed"
-                    )
-                if task.assigned_robot != robot.robot_id:
-                    raise ValueError(
-                        f"robot {robot.robot_id!r} executes task {task.task_id!r} but the "
-                        f"task is assigned to {task.assigned_robot!r}"
-                    )
+        # Ownership is judged with the exact rules direct construction uses:
+        # mutual bindings for work in progress, historical owners for finished
+        # tasks, and a collected task that may never lack its carrier.
+        cls._validate_task_ownership(robots, tasks)
         for task in tasks:
             if task.completed and not task.picked_up:
-                raise ValueError(f"task {task.task_id!r} is completed but never picked up")
+                raise ValueError(
+                    f"task {task.task_id!r} is completed but never picked up"
+                )
             if task.picked_up and task.assigned_robot is None:
+                # Direct construction never sees a finished task without a
+                # historical owner because it cannot create completion itself,
+                # but a checkpoint document can spell one, and the running
+                # simulator only ever saves picked-up tasks with a carrier.
                 raise ValueError(
                     f"task {task.task_id!r} is picked up but has no assigned robot"
                 )
-            # Completed tasks retain historical ownership; their robots are free
-            # to take new work, so the mutual binding only holds while a task is
-            # still in progress.
-            if not task.completed and task.assigned_robot is not None:
-                owner = robot_by_id.get(task.assigned_robot)
-                if owner is None:
-                    raise ValueError(
-                        f"task {task.task_id!r} is assigned to unknown robot "
-                        f"{task.assigned_robot!r}"
-                    )
-                if owner.task_id != task.task_id:
-                    raise ValueError(
-                        f"task {task.task_id!r} claims robot {owner.robot_id!r} but the "
-                        f"robot executes {owner.task_id!r}"
-                    )
 
         cls._validate_paused_state(paused, task_by_id, robot_by_id, grid)
         cls._validate_active_task_routes(paused, task_by_id, robot_by_id)
