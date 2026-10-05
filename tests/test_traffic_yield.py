@@ -647,6 +647,128 @@ class TrafficWaitRestoreTests(unittest.TestCase):
         self.assertEqual(loaded.metrics()["traffic_waits"], before)
 
 
+class TasklessRouteTests(unittest.TestCase):
+    """A robot without a task but with a remaining route is en route, not
+    parked: it drives its route and is never sidestepped for anyone."""
+
+    def build_convoy(self) -> FleetSimulator:
+        # 4x2, no obstacles, no tasks: A queued behind taskless B, both
+        # carrying a remaining route down the top row.
+        return FleetSimulator(
+            GridMap(4, 2),
+            [
+                Robot("A", (0, 0), route=[(1, 0), (2, 0), (3, 0)]),
+                Robot("B", (1, 0), route=[(2, 0), (3, 0)]),
+            ],
+            [],
+        )
+
+    def test_taskless_robot_drives_its_route_instead_of_yielding(self) -> None:
+        sim = self.build_convoy()
+        event = sim.step()
+        # B is expected to drive on, so A waits one tick instead of B being
+        # parked on the side cell (1, 1) with its route left dangling.
+        self.assertEqual(event["moved"], ["B"])
+        self.assertEqual(sim.robots["A"].position, (0, 0))
+        self.assertEqual(sim.robots["B"].position, (2, 0))
+        self.assertEqual(sim.robots["A"].distance_travelled, 0)
+        self.assertEqual(sim.robots["B"].distance_travelled, 1)
+        # Only the waypoint actually reached is consumed; the rest is kept.
+        self.assertEqual(sim.robots["B"].route, [(3, 0)])
+        self.assertEqual(sim.robots["A"].route, [(1, 0), (2, 0), (3, 0)])
+        # The blocker drove on within the tick, so no wait is recorded.
+        self.assertEqual(sim.status()["traffic_waits"], [])
+
+    def test_convoy_follows_on_without_diagonal_jumps_or_lost_waypoints(self) -> None:
+        sim = self.build_convoy()
+        previous = {rid: sim.robots[rid].position for rid in ("A", "B")}
+        for _ in range(3):
+            sim.step()
+            for rid in ("A", "B"):
+                robot = sim.robots[rid]
+                step = abs(robot.position[0] - previous[rid][0]) + abs(
+                    robot.position[1] - previous[rid][1]
+                )
+                self.assertLessEqual(step, 1)
+            previous = {rid: sim.robots[rid].position for rid in ("A", "B")}
+        # Both routes ran their course exactly along the top row.
+        self.assertEqual(sim.robots["B"].position, (3, 0))
+        self.assertEqual(sim.robots["B"].route, [])
+        self.assertEqual(sim.robots["B"].distance_travelled, 2)
+        self.assertEqual(sim.robots["A"].position, (2, 0))
+        self.assertEqual(sim.robots["A"].route, [(3, 0)])
+        # With its route fully consumed B is parked now, so the next tick may
+        # yield it onto a safe side cell for A -- the ordinary parking rule.
+        event = sim.step()
+        self.assertEqual(event["moved"], ["B", "A"])
+        self.assertEqual(sim.robots["B"].position, (3, 1))
+        self.assertEqual(sim.robots["A"].position, (3, 0))
+        self.assertEqual(sim.robots["A"].route, [])
+        self.assertEqual(sim.robots["A"].distance_travelled, 3)
+
+    def test_blocked_taskless_robot_keeps_position_and_route(self) -> None:
+        # 3x1 corridor: taskless A queued behind parked P with no side cell
+        # for anyone. A waits in place; its route is left untouched.
+        sim = FleetSimulator(
+            GridMap(3, 1),
+            [
+                Robot("A", (0, 0), route=[(1, 0), (2, 0)]),
+                Robot("P", (1, 0)),
+            ],
+            [],
+        )
+        for expected in range(1, 4):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.robots["A"].position, (0, 0))
+            self.assertEqual(sim.robots["A"].route, [(1, 0), (2, 0)])
+            self.assertEqual(sim.robots["A"].distance_travelled, 0)
+            self.assertEqual(
+                sim.status()["traffic_waits"],
+                [{"robot_id": "A", "blocked_by": ["P"], "ticks": expected}],
+            )
+
+    def test_taskless_blocker_is_not_parked_on_a_side_cell(self) -> None:
+        # 3x1 corridor, busy A behind taskless B behind parked C: nobody can
+        # move, and B must not be treated as a parking candidate either.
+        sim = FleetSimulator(
+            GridMap(3, 1),
+            [
+                Robot("A", (0, 0), route=[(1, 0), (2, 0)], task_id="T-1"),
+                Robot("B", (1, 0), route=[(2, 0)]),
+                Robot("C", (2, 0)),
+            ],
+            [Task("T-1", (0, 0), (2, 0), assigned_robot="A", picked_up=True)],
+        )
+        for _ in range(3):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.robots["B"].position, (1, 0))
+            self.assertEqual(sim.robots["B"].route, [(2, 0)])
+            self.assertEqual(sim.robots["B"].distance_travelled, 0)
+        waits = {entry["robot_id"]: entry for entry in sim.status()["traffic_waits"]}
+        self.assertEqual(waits["A"]["blocked_by"], ["B"])
+        self.assertEqual(waits["B"]["blocked_by"], ["C"])
+
+    def test_routeless_once_consumed_the_robot_yields_normally(self) -> None:
+        # The taskless robot drives its last waypoint, becomes parked, and
+        # from then on yields onto a safe side cell like any idle robot.
+        sim = FleetSimulator(
+            GridMap(3, 2),
+            [Robot("B", (0, 0), route=[(1, 0)])],
+            [],
+        )
+        sim.step()
+        self.assertEqual(sim.robots["B"].position, (1, 0))
+        self.assertEqual(sim.robots["B"].route, [])
+        sim.robots["A"] = Robot("A", (0, 0), route=[(1, 0), (2, 0)], task_id="T-1")
+        sim.tasks["T-1"] = Task("T-1", (0, 0), (2, 0), assigned_robot="A", picked_up=True)
+        event = sim.step()
+        self.assertEqual(event["moved"], ["B", "A"])
+        self.assertEqual(sim.robots["B"].position, (1, 1))
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+
+
 class PausedRobotsDoNotYieldTests(unittest.TestCase):
     def test_paused_robot_stays_put_and_never_yields(self) -> None:
         # 5x1 corridor; R-2's dropoff gets sealed off so it pauses, and R-1

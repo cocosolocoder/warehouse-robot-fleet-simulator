@@ -10,10 +10,17 @@ information recorded at the time.
 Automatic yielding
 ------------------
 When a robot's next waypoint is occupied by another robot, ``step()`` tries to
-keep traffic flowing instead of waiting forever: an idle blocker is asked to
-move onto a free side cell that lies on no robot's planned route, and a busy
-robot facing a blocker that cannot drive on may itself sidestep onto a free
-adjacent cell and replan its (still shortest) route from there. A retreat that
+keep traffic flowing instead of waiting forever: a parked blocker -- one with
+neither a task nor a remaining route -- is asked to move onto a free side cell
+that lies on no robot's planned route, and a busy robot facing a blocker that
+cannot drive on may itself sidestep onto a free adjacent cell and replan its
+(still shortest) route from there. A robot created without a task but with a
+remaining route is en route, not parked: it keeps driving exactly that route
+cell by cell like any busy robot, is never sidestepped onto a side cell for
+someone else, and simply waits in place -- position and remaining waypoints
+untouched -- when its next cell cannot be taken this tick. Only once such a
+route is fully consumed does the robot count as parked and yield the usual
+way. A retreat that
 only leads back to the same immovable blocker is never taken though: if the
 replanned route immediately returns through the vacated cell, still passes the
 blocker's cell and the blocker cannot use the opening to leave (a dead end or
@@ -622,12 +629,15 @@ class FleetSimulator:
         occupied: dict[Position, str],
         reserved: dict[Position, str],
     ) -> Position | None:
-        """Free side-cell an idle blocker can yield to, or None.
+        """Free side-cell a parked blocker can yield to, or None.
 
-        The requester's own cell is forbidden (yielding onto it would swap the
-        two robots within one tick); every other safety condition is shared via
-        :meth:`_safe_side_cells`, so the blocker never trades one blockage for
-        another. The first candidate in neighbour order wins.
+        Only robots with neither a task nor a remaining route are ever asked
+        to yield this way; a taskless robot still holding a route keeps
+        driving it. The requester's own cell is forbidden (yielding onto it
+        would swap the two robots within one tick); every other safety
+        condition is shared via :meth:`_safe_side_cells`, so the blocker never
+        trades one blockage for another. The first candidate in neighbour
+        order wins.
         """
         return next(
             self._safe_side_cells(
@@ -741,11 +751,14 @@ class FleetSimulator:
     ) -> bool:
         """Whether *blocker* can leave its cell this tick in the given layout.
 
-        An idle blocker leaves only by yielding onto a safe side cell for the
-        requesting robot; a busy blocker leaves by driving onto its next
-        waypoint (possibly following a chain of robots that all move this tick)
-        or by sidestepping onto a free adjacent cell itself. Robots paused by
-        map unreachability never move. *checking* names robots whose leave
+        A parked blocker -- no task and no remaining route -- leaves only by
+        yielding onto a safe side cell for the requesting robot; a robot still
+        holding a route (busy or taskless alike) leaves by driving onto its
+        next waypoint (possibly following a chain of robots that all move this
+        tick), and a busy robot may additionally sidestep onto a free adjacent
+        cell itself. A taskless robot with a remaining route never sidesteps:
+        it keeps driving exactly the route it was created with. Robots paused
+        by map unreachability never move. *checking* names robots whose leave
         check is already on the call stack, so a cyclic dependency (a head-on
         deadlock, or the requester itself) is not assumed resolvable.
         *blocked_path* holds the cells the retreating requester must drive back
@@ -762,12 +775,12 @@ class FleetSimulator:
             # A busy robot with no route left only arrives/finishes this tick;
             # it never drives or sidesteps for anyone.
             return False
-        if task is None:
-            # Idle robots only ever move by yielding for a requester, and they
-            # do so onto the first safe cell in neighbour order. When that
-            # particular cell sits on the path the retreating requester must
-            # re-enter, parking there only relocates the blockage instead of
-            # clearing it, so it does not count as leaving.
+        if task is None and not blocker.route:
+            # Parked robots only ever move by yielding for a requester, and
+            # they do so onto the first safe cell in neighbour order. When
+            # that particular cell sits on the path the retreating requester
+            # must re-enter, parking there only relocates the blockage instead
+            # of clearing it, so it does not count as leaving.
             side = self._idle_sidestep_cell(blocker, requester, occupied, reserved)
             return side is not None and side not in blocked_path
         if blocker.route:
@@ -795,6 +808,10 @@ class FleetSimulator:
                     blocked_path,
                 ):
                     return True
+        if task is None:
+            # A taskless robot still holding a route only ever drives that
+            # route; it cannot be parked on a side cell for anyone.
+            return False
         # Otherwise the blocker might sidestep onto a free side cell itself,
         # but not onto a cell the retreating requester still has to use --
         # parking there only moves the blockage.
@@ -970,9 +987,12 @@ class FleetSimulator:
             # map-unreachability pause and the task stays active.
             blocker = self.robots[blocker_id]
             if blocker_id not in moved_ids:
-                if blocker.task_id is None:
-                    # Idle blocker: ask it to yield onto a free side cell,
-                    # then take over the cell it vacated.
+                if blocker.task_id is None and not blocker.route:
+                    # Parked blocker with neither task nor remaining route:
+                    # ask it to yield onto a free side cell, then take over
+                    # the cell it vacated. A taskless robot that still holds
+                    # a route is en route, not parked, and is never moved
+                    # aside -- it is handled like any busy blocker below.
                     side = self._idle_sidestep_cell(blocker, robot, occupied, reserved)
                     if side is not None:
                         relocate(blocker, side)
