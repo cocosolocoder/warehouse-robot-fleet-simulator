@@ -4,7 +4,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from warehouse_fleet import FleetSimulator, GridMap, Robot, Task, shortest_path
 
@@ -27,6 +29,72 @@ def run_until_done(simulator: FleetSimulator, limit: int = 30) -> FleetSimulator
         if metrics["tasks_completed"] == metrics["tasks_total"]:
             break
     return simulator
+
+
+def carried_goods_scenario() -> FleetSimulator:
+    """One task whose goods are collected mid-route but not yet delivered.
+
+    At tick 0 the robot still stands on its start cell with the goods
+    uncollected; after one ``step()`` it has moved onto the pickup cell,
+    carries the goods, and still has three waypoints to the dropoff. Saving
+    that state therefore has concrete business content that must never leak
+    into a checkpoint that was supposed to keep the older tick-0 state.
+    """
+    return FleetSimulator(
+        GridMap(6, 1),
+        [Robot("A", (0, 0))],
+        [Task("T-1", (1, 0), (4, 0))],
+    )
+
+
+class _PartiallyWrittenFile:
+    """Binary file proxy which writes a prefix, then fails like a disk error.
+
+    Wrapping the file object returned by ``os.fdopen`` lets a test prove the
+    temp file had already received (and flushed) part of the new payload when
+    the filesystem error occurred.
+    """
+
+    def __init__(self, raw, prefix_bytes: int) -> None:
+        self._raw = raw
+        self._prefix_bytes = prefix_bytes
+
+    def write(self, data):
+        self._raw.write(bytes(data)[: self._prefix_bytes])
+        self._raw.flush()
+        raise OSError("simulated filesystem write failure")
+
+    def flush(self):
+        return self._raw.flush()
+
+    def fileno(self):
+        return self._raw.fileno()
+
+    def close(self):
+        return self._raw.close()
+
+
+@contextmanager
+def _save_failing_at(point: str):
+    """Inject an OSError at one of the three post-start save stages."""
+    if point == "write":
+        real_fdopen = os.fdopen
+
+        def failing_fdopen(fd, mode="wb", *args, **kwargs):
+            return _PartiallyWrittenFile(
+                real_fdopen(fd, mode, *args, **kwargs), prefix_bytes=64
+            )
+
+        with patch("os.fdopen", side_effect=failing_fdopen):
+            yield
+    elif point == "sync":
+        # Payload written and flushed; the pre-replace durability sync fails.
+        with patch("os.fsync", side_effect=OSError("simulated fsync failure")):
+            yield
+    else:
+        # Payload fully written and synced; the atomic rename fails.
+        with patch("os.replace", side_effect=OSError("simulated replace failure")):
+            yield
 
 
 class PathfindingTests(unittest.TestCase):
@@ -376,6 +444,165 @@ class AtomicSaveTests(unittest.TestCase):
             loaded = FleetSimulator.load_checkpoint(path)
             self.assertEqual(loaded.tick, 1)
             self.assertEqual(loaded.snapshot(), simulator.snapshot())
+
+
+class SaveFailureAtomicityTests(unittest.TestCase):
+    """Failures after the save has started must never corrupt the target.
+
+    The old tests only covered a missing parent directory, where the save
+    stops before any temp file exists. These tests inject an ``OSError`` while
+    the new payload is being written, while it is synced before the rename,
+    and while the atomic rename itself runs -- for both an existing valid
+    checkpoint and a brand-new target path.
+    """
+
+    FAILURE_POINTS = ("write", "sync", "replace")
+
+    def _old_and_new_simulators(self):
+        """An old tick-0 checkpoint state and a clearly different new one.
+
+        The new simulator has already stepped onto the pickup cell, carries the
+        goods (picked up, not delivered), keeps a real remaining route, and has
+        one replay frame -- every one of which is absent from the old state, so
+        mixing the two would be immediately visible.
+        """
+        old_sim = carried_goods_scenario()
+        new_sim = carried_goods_scenario()
+        new_sim.step()
+        self.assertTrue(new_sim.tasks["T-1"].picked_up)
+        self.assertFalse(new_sim.tasks["T-1"].completed)
+        self.assertEqual(new_sim.robots["A"].position, (1, 0))
+        self.assertEqual(new_sim.robots["A"].route, [(2, 0), (3, 0), (4, 0)])
+        self.assertEqual(len(new_sim.replay), 1)
+        return old_sim, new_sim
+
+    def _assert_new_state_intact(self, simulator: FleetSimulator) -> None:
+        # A failed save must not advance the clock, move the robot, consume the
+        # route, touch task state, append replay or alter statistics.
+        self.assertEqual(simulator.tick, 1)
+        robot = simulator.robots["A"]
+        self.assertEqual(robot.position, (1, 0))
+        self.assertEqual(robot.route, [(2, 0), (3, 0), (4, 0)])
+        self.assertEqual(robot.distance_travelled, 1)
+        self.assertEqual(robot.task_id, "T-1")
+        task = simulator.tasks["T-1"]
+        self.assertTrue(task.picked_up)
+        self.assertFalse(task.completed)
+        self.assertEqual(task.assigned_robot, "A")
+        self.assertEqual(len(simulator.replay), 1)
+        self.assertEqual(simulator.metrics()["tasks_completed"], 0)
+
+    def _assert_old_state_loads(self, path: str) -> None:
+        loaded = FleetSimulator.load_checkpoint(path)
+        self.assertEqual(loaded.tick, 0)
+        self.assertEqual(loaded.robots["A"].position, (0, 0))
+        self.assertEqual(loaded.robots["A"].distance_travelled, 0)
+        self.assertIsNone(loaded.robots["A"].task_id)
+        self.assertFalse(loaded.tasks["T-1"].picked_up)
+        self.assertFalse(loaded.tasks["T-1"].completed)
+        self.assertEqual(loaded.replay, [])
+
+    def _assert_no_temp_leftovers(self, directory: str, unrelated: str) -> None:
+        entries = sorted(os.listdir(directory))
+        self.assertEqual(
+            [name for name in entries if name.startswith(".checkpoint-")], []
+        )
+        self.assertEqual(Path(unrelated).read_bytes(), b"unrelated file\n")
+        return entries
+
+    def test_existing_checkpoint_survives_every_post_start_failure(self) -> None:
+        for point in self.FAILURE_POINTS:
+            with self.subTest(point=point):
+                old_sim, new_sim = self._old_and_new_simulators()
+                snapshot_before = new_sim.snapshot()
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "state.json")
+                    old_sim.save_checkpoint(path)
+                    old_bytes = Path(path).read_bytes()
+                    unrelated = os.path.join(tmp, "unrelated.txt")
+                    Path(unrelated).write_bytes(b"unrelated file\n")
+
+                    with self.assertRaises(OSError):
+                        with _save_failing_at(point):
+                            new_sim.save_checkpoint(path)
+
+                    # The old file is byte-for-byte intact, never emptied or
+                    # replaced by a half-written temp file.
+                    self.assertEqual(Path(path).read_bytes(), old_bytes)
+                    entries = self._assert_no_temp_leftovers(tmp, unrelated)
+                    self.assertEqual(entries, ["state.json", "unrelated.txt"])
+                    self.assertEqual(new_sim.snapshot(), snapshot_before)
+                    self._assert_new_state_intact(new_sim)
+                    self._assert_old_state_loads(path)
+
+    def test_new_target_and_temp_file_absent_after_every_post_start_failure(
+        self,
+    ) -> None:
+        for point in self.FAILURE_POINTS:
+            with self.subTest(point=point):
+                _, new_sim = self._old_and_new_simulators()
+                snapshot_before = new_sim.snapshot()
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "state.json")
+                    unrelated = os.path.join(tmp, "unrelated.txt")
+                    Path(unrelated).write_bytes(b"unrelated file\n")
+
+                    with self.assertRaises(OSError):
+                        with _save_failing_at(point):
+                            new_sim.save_checkpoint(path)
+
+                    self.assertFalse(os.path.exists(path))
+                    entries = self._assert_no_temp_leftovers(tmp, unrelated)
+                    self.assertEqual(entries, ["unrelated.txt"])
+                    self.assertEqual(new_sim.snapshot(), snapshot_before)
+                    self._assert_new_state_intact(new_sim)
+
+    def test_simulator_saves_again_once_existing_target_failure_clears(self) -> None:
+        for point in self.FAILURE_POINTS:
+            with self.subTest(point=point):
+                old_sim, new_sim = self._old_and_new_simulators()
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "state.json")
+                    old_sim.save_checkpoint(path)
+                    old_bytes = Path(path).read_bytes()
+                    with self.assertRaises(OSError):
+                        with _save_failing_at(point):
+                            new_sim.save_checkpoint(path)
+                    self.assertEqual(Path(path).read_bytes(), old_bytes)
+
+                    # Error condition gone: the same instance saves the new
+                    # state, which fully replaces the old file.
+                    new_sim.save_checkpoint(path)
+                    new_bytes = Path(path).read_bytes()
+                    self.assertNotEqual(new_bytes, old_bytes)
+                    loaded = FleetSimulator.load_checkpoint(path)
+                    self.assertEqual(loaded.snapshot(), new_sim.snapshot())
+                    self.assertEqual(loaded.tick, 1)
+                    self.assertTrue(loaded.tasks["T-1"].picked_up)
+                    self.assertEqual(
+                        loaded.robots["A"].route, [(2, 0), (3, 0), (4, 0)]
+                    )
+                    run_until_done(loaded)
+                    self.assertTrue(loaded.tasks["T-1"].completed)
+
+    def test_simulator_saves_again_once_new_target_failure_clears(self) -> None:
+        for point in self.FAILURE_POINTS:
+            with self.subTest(point=point):
+                _, new_sim = self._old_and_new_simulators()
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "state.json")
+                    with self.assertRaises(OSError):
+                        with _save_failing_at(point):
+                            new_sim.save_checkpoint(path)
+                    self.assertFalse(os.path.exists(path))
+
+                    new_sim.save_checkpoint(path)
+                    self.assertTrue(os.path.exists(path))
+                    loaded = FleetSimulator.load_checkpoint(path)
+                    self.assertEqual(loaded.snapshot(), new_sim.snapshot())
+                    self.assertTrue(loaded.tasks["T-1"].picked_up)
+                    run_until_done(loaded)
+                    self.assertTrue(loaded.tasks["T-1"].completed)
 
 
 class CommandLineTests(unittest.TestCase):
