@@ -889,57 +889,103 @@ class FleetSimulator:
         back through: another robot parking there only moves the blockage, so
         such sidesteps do not count as leaving (driving on along the cell on
         the blocker's own route does).
+
+        The chain of robots each blocked by the next is walked iteratively
+        rather than by recursion: a legal queue may hold far more robots than
+        the interpreter's recursion limit, and following it must never abort
+        the tick with a :class:`RecursionError`.
         """
-        if blocker.robot_id in checking:
-            return False
-        task = self.tasks[blocker.task_id] if blocker.task_id is not None else None
-        if task is not None and task.task_id in self.paused_tasks:
-            return False
-        if not blocker.route:
-            if task is not None:
-                # A busy robot with no route left only arrives/finishes this
-                # tick; it never drives or sidesteps for anyone.
-                return False
-            # A parked robot (no task and no remaining route) leaves only by
-            # yielding onto a safe side cell for the requesting robot; it does
-            # so onto the first safe cell in neighbour order. When that
-            # particular cell sits on the path the retreating requester must
-            # re-enter, parking there only relocates the blockage instead of
-            # clearing it, so it does not count as leaving.
-            side = self._idle_sidestep_cell(blocker, requester, occupied, reserved)
-            return side is not None and side not in blocked_path
-        ahead = blocker.route[0]
-        if (
-            self.grid.traversable(ahead)
-            and ahead not in occupied
-            and ahead not in reserved
-        ):
-            return True
-        occupant_id = occupied.get(ahead) or reserved.get(ahead)
-        if (
-            occupant_id is not None
-            and occupant_id != blocker.robot_id
-            and occupant_id not in checking
-        ):
-            # The blocker could follow the robot ahead once that robot
-            # vacates its cell this same tick.
-            if self._can_vacate(
-                self.robots[occupant_id],
-                requester,
-                occupied,
-                reserved,
-                checking | {blocker.robot_id},
-                blocked_path,
+        # Robots whose leave check is deferred until the robot ahead of them
+        # is resolved, nearest first; *seen* plays the role of *checking*
+        # while descending the chain.
+        chain: list[Robot] = []
+        seen = set(checking)
+        current = blocker
+        while True:
+            if current.robot_id in seen:
+                can_leave = False
+                break
+            task = (
+                self.tasks[current.task_id] if current.task_id is not None else None
+            )
+            if task is not None and task.task_id in self.paused_tasks:
+                can_leave = False
+                break
+            if not current.route:
+                if task is not None:
+                    # A busy robot with no route left only arrives/finishes
+                    # this tick; it never drives or sidesteps for anyone.
+                    can_leave = False
+                    break
+                # A parked robot (no task and no remaining route) leaves only
+                # by yielding onto a safe side cell for the requesting robot;
+                # it does so onto the first safe cell in neighbour order. When
+                # that particular cell sits on the path the retreating
+                # requester must re-enter, parking there only relocates the
+                # blockage instead of clearing it, so it does not count as
+                # leaving.
+                side = self._idle_sidestep_cell(current, requester, occupied, reserved)
+                can_leave = side is not None and side not in blocked_path
+                break
+            ahead = current.route[0]
+            if (
+                self.grid.traversable(ahead)
+                and ahead not in occupied
+                and ahead not in reserved
             ):
-                return True
+                can_leave = True
+                break
+            occupant_id = occupied.get(ahead) or reserved.get(ahead)
+            if (
+                occupant_id is not None
+                and occupant_id != current.robot_id
+                and occupant_id not in seen
+            ):
+                # The robot could follow the robot ahead once that robot
+                # vacates its cell this same tick; defer the decision and
+                # continue down the chain.
+                chain.append(current)
+                seen.add(current.robot_id)
+                current = self.robots[occupant_id]
+                continue
+            can_leave = self._sidestep_escape(
+                current, task, occupied, reserved, blocked_path
+            )
+            break
+        # Unwind the deferred robots back towards the requester: each one can
+        # leave if the robot ahead of it could, otherwise it falls back to its
+        # own sidestep escape.
+        while chain:
+            current = chain.pop()
+            if not can_leave:
+                task = (
+                    self.tasks[current.task_id]
+                    if current.task_id is not None
+                    else None
+                )
+                can_leave = self._sidestep_escape(
+                    current, task, occupied, reserved, blocked_path
+                )
+        return can_leave
+
+    def _sidestep_escape(
+        self,
+        blocker: Robot,
+        task: Task | None,
+        occupied: dict[Position, str],
+        reserved: dict[Position, str],
+        blocked_path: frozenset[Position],
+    ) -> bool:
+        """Whether a blocked robot can leave by sidestepping onto a side cell.
+
+        A taskless robot that still drives a remaining route never sidesteps
+        off it -- not even to unblock a requester -- so a side cell cannot
+        count as a way out for it. A task-bound blocker might sidestep onto a
+        free side cell itself, but not onto a cell the retreating requester
+        still has to use -- parking there only moves the blockage.
+        """
         if task is None:
-            # A taskless robot that still drives a remaining route never
-            # sidesteps off it -- not even to unblock a requester -- so a side
-            # cell cannot count as a way out for it.
             return False
-        # Otherwise the task-bound blocker might sidestep onto a free side
-        # cell itself, but not onto a cell the retreating requester still has
-        # to use -- parking there only moves the blockage.
         for side_cell in self._safe_side_cells(
             blocker, occupied, reserved, forbidden=blocked_path
         ):
