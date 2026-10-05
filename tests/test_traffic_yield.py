@@ -835,6 +835,270 @@ class TrafficWaitCheckpointTests(unittest.TestCase):
         )
 
 
+class LongQueueJamTests(unittest.TestCase):
+    """A legal queue longer than Python's recursion depth must still step.
+
+    A single-cell-wide corridor holds twelve hundred robots: the first is
+    loaded and routes along the whole queue toward the dropoff at the end,
+    every middle robot keeps a one-cell preset route into the car ahead, and
+    the last robot is parked at the end with no task and no route. One empty
+    cell lies behind the first robot. The old leave check walked the
+    occupancy chain recursively (``_can_vacate`` calling itself per car) and
+    raised :class:`RecursionError` out of ``step()``; the check must instead
+    treat the finite queue as ordinary traffic and return a normal tick.
+    """
+
+    QUEUE_SIZE = 1200
+
+    def build(self, size: int = QUEUE_SIZE) -> FleetSimulator:
+        n = size
+        robots = [
+            Robot(
+                "R-0001",
+                (1, 0),
+                route=[(x, 0) for x in range(2, n + 1)],
+                task_id="T-1",
+            )
+        ]
+        for index in range(2, n + 1):
+            route = [(index + 1, 0)] if index < n else []
+            robots.append(Robot(f"R-{index:04d}", (index, 0), route=route))
+        tasks = [
+            Task("T-1", (1, 0), (n, 0), assigned_robot="R-0001", picked_up=True)
+        ]
+        return FleetSimulator(GridMap(n + 1, 1), robots, tasks)
+
+    def expected_waits(self, ticks: int, size: int = QUEUE_SIZE) -> list[dict]:
+        return [
+            {
+                "robot_id": f"R-{index:04d}",
+                "blocked_by": [f"R-{index + 1:04d}"],
+                "ticks": ticks,
+            }
+            for index in range(1, size)
+        ]
+
+    def test_step_returns_a_normal_frame_without_recursion_error(self) -> None:
+        sim = self.build()
+        event = sim.step()
+        self.assertEqual(event["type"], "tick")
+        self.assertEqual(event["tick"], 1)
+        self.assertEqual(event["moved"], [])
+        self.assertEqual(sim.tick, 1)
+        self.assertEqual(len(sim.replay), 1)
+        self.assertEqual(len(event["robots"]), self.QUEUE_SIZE)
+
+    def test_every_robot_keeps_place_route_and_mileage_over_several_ticks(self) -> None:
+        sim = self.build()
+        positions = {
+            robot_id: robot.position for robot_id, robot in sim.robots.items()
+        }
+        routes = {
+            robot_id: list(robot.route) for robot_id, robot in sim.robots.items()
+        }
+        for tick in range(1, 6):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.tick, tick)
+            for robot_id, robot in sim.robots.items():
+                self.assertEqual(robot.position, positions[robot_id])
+                self.assertEqual(robot.route, routes[robot_id])
+                self.assertEqual(robot.distance_travelled, 0)
+        self.assertEqual(sim.metrics()["distance_total"], 0)
+
+    def test_first_robot_keeps_cargo_and_task_and_never_delivers_or_retreats(self) -> None:
+        sim = self.build()
+        leader = sim.robots["R-0001"]
+        for _ in range(5):
+            sim.step()
+            self.assertEqual(leader.position, (1, 0))
+        # The empty cell behind it is never used for a back-and-forth shuttle.
+        self.assertNotIn((0, 0), {r.position for r in sim.robots.values()})
+        self.assertEqual(leader.task_id, "T-1")
+        self.assertEqual(leader.route[0], (2, 0))
+        self.assertEqual(len(leader.route), self.QUEUE_SIZE - 1)
+        task = sim.tasks["T-1"]
+        self.assertTrue(task.picked_up)
+        self.assertFalse(task.completed)
+        self.assertEqual(task.assigned_robot, "R-0001")
+
+    def test_waits_are_traffic_waits_against_the_actual_occupants(self) -> None:
+        sim = self.build()
+        for ticks in range(1, 5):
+            sim.step()
+            report = sim.status()["traffic_waits"]
+            self.assertEqual(report, self.expected_waits(ticks))
+            self.assertEqual(sim.metrics()["traffic_waits"], report)
+        # The parked tail itself never appears as waiting.
+        self.assertNotIn(
+            f"R-{self.QUEUE_SIZE:04d}",
+            {entry["robot_id"] for entry in sim.status()["traffic_waits"]},
+        )
+
+    def test_jam_is_not_reported_as_map_unreachability(self) -> None:
+        sim = self.build()
+        for _ in range(3):
+            sim.step()
+        self.assertEqual(sim.status()["paused_tasks"], [])
+        self.assertEqual(sim.metrics()["tasks_paused"], [])
+        self.assertTrue(sim.robots["R-0001"].route)
+
+
+class LongQueueYieldTests(unittest.TestCase):
+    """A genuine safe side cell at the tail still unlocks a very long queue."""
+
+    QUEUE_SIZE = 1200
+
+    def build(self, size: int = QUEUE_SIZE) -> FleetSimulator:
+        n = size
+        # The second row is walled off except for the single pocket beside
+        # the parked tail, so the pocket lies on no other robot's route.
+        obstacles = frozenset((x, 1) for x in range(0, n))
+        robots = [
+            Robot(
+                "R-0001",
+                (1, 0),
+                route=[(x, 0) for x in range(2, n + 1)],
+                task_id="T-1",
+            )
+        ]
+        for index in range(2, n + 1):
+            route = [(index + 1, 0)] if index < n else []
+            robots.append(Robot(f"R-{index:04d}", (index, 0), route=route))
+        tasks = [
+            Task("T-1", (1, 0), (n, 0), assigned_robot="R-0001", picked_up=True)
+        ]
+        return FleetSimulator(GridMap(n + 1, 2, obstacles), robots, tasks)
+
+    def test_tail_yields_into_pocket_and_queue_keeps_driving_on(self) -> None:
+        sim = self.build()
+        tail_id = f"R-{self.QUEUE_SIZE:04d}"
+        penultimate_id = f"R-{self.QUEUE_SIZE - 1:04d}"
+        event = sim.step()
+        # The parked tail yields and the robot behind it takes the vacated
+        # cell in the same tick -- the ordinary yield rules, applied to a
+        # queue that happens to be twelve hundred cars long.
+        self.assertIn(tail_id, event["moved"])
+        self.assertIn(penultimate_id, event["moved"])
+        self.assertEqual(sim.robots[tail_id].position, (self.QUEUE_SIZE, 1))
+        self.assertEqual(sim.robots[penultimate_id].position, (self.QUEUE_SIZE, 0))
+        self.assertEqual(sim.robots[penultimate_id].route, [])
+        self.assertEqual(sim.robots[tail_id].distance_travelled, 1)
+        # Each later tick frees one more car from the tail of the queue.
+        for tick, freed in enumerate(
+            range(self.QUEUE_SIZE - 2, self.QUEUE_SIZE - 6, -1), start=2
+        ):
+            event = sim.step()
+            self.assertEqual(sim.tick, tick)
+            self.assertIn(f"R-{freed:04d}", event["moved"])
+            self.assertEqual(sim.robots[f"R-{freed:04d}"].position, (freed + 1, 0))
+        self.assertFalse(sim.tasks["T-1"].completed)
+
+    def test_safe_pocket_is_off_every_other_route(self) -> None:
+        sim = self.build()
+        for robot in sim.robots.values():
+            self.assertNotIn((self.QUEUE_SIZE, 1), robot.route)
+        sim.step()
+        assert_no_collisions(self, sim)
+
+
+class LongQueueCycleTests(unittest.TestCase):
+    """A long dependency chain that folds back into a cycle has no exit."""
+
+    QUEUE_SIZE = 1200
+
+    def build(self, size: int = QUEUE_SIZE) -> FleetSimulator:
+        n = size
+        robots = [
+            Robot(
+                "R-0001",
+                (1, 0),
+                route=[(x, 0) for x in range(2, n + 1)],
+                task_id="T-1",
+            )
+        ]
+        for index in range(2, n):
+            robots.append(Robot(f"R-{index:04d}", (index, 0), route=[(index + 1, 0)]))
+        # The tail points back at its predecessor: every robot around the
+        # fold carries a route, but the ring cannot resolve itself.
+        robots.append(Robot(f"R-{n:04d}", (n, 0), route=[(n - 1, 0)]))
+        tasks = [
+            Task("T-1", (1, 0), (n, 0), assigned_robot="R-0001", picked_up=True)
+        ]
+        return FleetSimulator(GridMap(n + 1, 1), robots, tasks)
+
+    def test_cycle_terminates_as_plain_traffic_waiting(self) -> None:
+        sim = self.build()
+        positions = {rid: r.position for rid, r in sim.robots.items()}
+        for tick in range(1, 4):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(sim.tick, tick)
+        waits = {entry["robot_id"]: entry for entry in sim.status()["traffic_waits"]}
+        self.assertEqual(len(waits), self.QUEUE_SIZE)
+        self.assertEqual(waits["R-0001"]["blocked_by"], ["R-0002"])
+        self.assertEqual(
+            waits[f"R-{self.QUEUE_SIZE - 1:04d}"]["blocked_by"],
+            [f"R-{self.QUEUE_SIZE:04d}"],
+        )
+        self.assertEqual(
+            waits[f"R-{self.QUEUE_SIZE:04d}"]["blocked_by"],
+            [f"R-{self.QUEUE_SIZE - 1:04d}"],
+        )
+        self.assertTrue(all(entry["ticks"] == 3 for entry in waits.values()))
+        self.assertEqual(sim.status()["paused_tasks"], [])
+        self.assertEqual(sim.metrics()["distance_total"], 0)
+        for robot_id, robot in sim.robots.items():
+            self.assertEqual(robot.position, positions[robot_id])
+
+
+class LongQueueFreeExitTests(unittest.TestCase):
+    """A twelve-hundred-car chain ending at a free cell flows, not jams."""
+
+    QUEUE_SIZE = 1200
+
+    def build(self) -> FleetSimulator:
+        n = self.QUEUE_SIZE
+        grid = GridMap(n + 2, 1)  # cell (n + 1, 0) stays free past the tail
+        robots = [
+            Robot(
+                "R-0001",
+                (1, 0),
+                route=[(x, 0) for x in range(2, n + 1)],
+                task_id="T-1",
+            )
+        ]
+        for index in range(2, n + 1):
+            route = [(index + 1, 0)] if index < n else [(n + 1, 0)]
+            robots.append(Robot(f"R-{index:04d}", (index, 0), route=route))
+        tasks = [
+            Task("T-1", (1, 0), (n, 0), assigned_robot="R-0001", picked_up=True)
+        ]
+        return FleetSimulator(grid, robots, tasks)
+
+    def test_leave_check_follows_the_whole_chain_to_the_free_cell(self) -> None:
+        sim = self.build()
+        event = sim.step()
+        tail = f"R-{self.QUEUE_SIZE:04d}"
+        self.assertIn(tail, event["moved"])
+        self.assertEqual(sim.robots[tail].position, (self.QUEUE_SIZE + 1, 0))
+        # The penultimate car's next cell is free once the tail drives on, so
+        # its mid-tick wait is reconciled away at tick end.
+        waits = {entry["robot_id"] for entry in sim.status()["traffic_waits"]}
+        self.assertNotIn(f"R-{self.QUEUE_SIZE - 1:04d}", waits)
+        # The follow propagates one car per tick without recursion errors.
+        for _ in range(4):
+            sim.step()
+        self.assertEqual(
+            sim.robots[f"R-{self.QUEUE_SIZE - 4:04d}"].position,
+            (self.QUEUE_SIZE - 3, 0),
+        )
+        self.assertEqual(
+            sim.robots[f"R-{self.QUEUE_SIZE - 5:04d}"].position,
+            (self.QUEUE_SIZE - 5, 0),
+        )
+
+
 class YieldDeterminismTests(unittest.TestCase):
     def test_input_list_order_does_not_change_results(self) -> None:
         first = swap_scenario()

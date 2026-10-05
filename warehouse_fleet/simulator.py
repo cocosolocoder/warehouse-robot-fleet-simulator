@@ -882,69 +882,92 @@ class FleetSimulator:
         -- leaves by driving onto its next waypoint (possibly following a
         chain of robots that all move this tick); a task-bound one may also
         sidestep onto a free adjacent cell itself. Robots paused by map
-        unreachability never move. *checking* names robots whose leave check
-        is already on the call stack, so a cyclic dependency (a head-on
-        deadlock, or the requester itself) is not assumed resolvable.
+        unreachability never move. *checking* names robots already on the
+        dependency chain (including robots that used their one move of this
+        tick), so meeting one again closes a cyclic dependency -- a head-on
+        deadlock, or the requester itself -- and never proves an exit merely
+        because every robot on the cycle still carries a route.
         *blocked_path* holds the cells the retreating requester must drive
         back through: another robot parking there only moves the blockage, so
         such sidesteps do not count as leaving (driving on along the cell on
         the blocker's own route does).
+
+        The follow chain can run through an arbitrarily long legal queue, so
+        the search is an explicit stack rather than Python recursion: a queue
+        of twelve hundred robots ending at a parked robot with no side cell
+        must report "cannot vacate" from a normal ``step()`` instead of
+        raising :class:`RecursionError`. Each frame is
+        ``(robot, checking, resume)``. A frame examined for the first time
+        first tries the free-waypoint and follow-chain rules; only when the
+        chain ahead comes back empty does it resume at its own side-cell
+        scan, which is exactly the order the single recursive call imposed.
         """
-        if blocker.robot_id in checking:
-            return False
-        task = self.tasks[blocker.task_id] if blocker.task_id is not None else None
-        if task is not None and task.task_id in self.paused_tasks:
-            return False
-        if not blocker.route:
-            if task is not None:
-                # A busy robot with no route left only arrives/finishes this
-                # tick; it never drives or sidesteps for anyone.
-                return False
-            # A parked robot (no task and no remaining route) leaves only by
-            # yielding onto a safe side cell for the requesting robot; it does
-            # so onto the first safe cell in neighbour order. When that
-            # particular cell sits on the path the retreating requester must
-            # re-enter, parking there only relocates the blockage instead of
-            # clearing it, so it does not count as leaving.
-            side = self._idle_sidestep_cell(blocker, requester, occupied, reserved)
-            return side is not None and side not in blocked_path
-        ahead = blocker.route[0]
-        if (
-            self.grid.traversable(ahead)
-            and ahead not in occupied
-            and ahead not in reserved
-        ):
-            return True
-        occupant_id = occupied.get(ahead) or reserved.get(ahead)
-        if (
-            occupant_id is not None
-            and occupant_id != blocker.robot_id
-            and occupant_id not in checking
-        ):
-            # The blocker could follow the robot ahead once that robot
-            # vacates its cell this same tick.
-            if self._can_vacate(
-                self.robots[occupant_id],
-                requester,
-                occupied,
-                reserved,
-                checking | {blocker.robot_id},
-                blocked_path,
+        stack: list[tuple[Robot, frozenset[str], bool]] = [(blocker, checking, False)]
+        while stack:
+            current, current_checking, resume = stack.pop()
+            if current.robot_id in current_checking:
+                # The chain has folded back onto a robot it already depends
+                # on: a cycle cannot vacate itself. The frame that followed
+                # this one simply resumes with its own side-cell options.
+                continue
+            task = self.tasks[current.task_id] if current.task_id is not None else None
+            if task is not None and task.task_id in self.paused_tasks:
+                continue
+            if not current.route:
+                if task is not None:
+                    # A busy robot with no route left only arrives/finishes this
+                    # tick; it never drives or sidesteps for anyone.
+                    continue
+                # A parked robot (no task and no remaining route) leaves only by
+                # yielding onto a safe side cell for the requesting robot; it does
+                # so onto the first safe cell in neighbour order. When that
+                # particular cell sits on the path the retreating requester must
+                # re-enter, parking there only relocates the blockage instead of
+                # clearing it, so it does not count as leaving.
+                side = self._idle_sidestep_cell(current, requester, occupied, reserved)
+                if side is not None and side not in blocked_path:
+                    return True
+                continue
+            if not resume:
+                ahead = current.route[0]
+                if (
+                    self.grid.traversable(ahead)
+                    and ahead not in occupied
+                    and ahead not in reserved
+                ):
+                    return True
+                occupant_id = occupied.get(ahead) or reserved.get(ahead)
+                if (
+                    occupant_id is not None
+                    and occupant_id != current.robot_id
+                    and occupant_id not in current_checking
+                ):
+                    # The robot could follow the occupant once that robot
+                    # vacates its cell this same tick. This frame resumes with
+                    # its side-cell scan only after the chain ahead proves it
+                    # cannot clear, mirroring the recursive call order.
+                    stack.append((current, current_checking, True))
+                    stack.append(
+                        (
+                            self.robots[occupant_id],
+                            current_checking | {current.robot_id},
+                            False,
+                        )
+                    )
+                    continue
+            if task is None:
+                # A taskless robot that still drives a remaining route never
+                # sidesteps off it -- not even to unblock a requester -- so a side
+                # cell cannot count as a way out for it.
+                continue
+            # Otherwise the task-bound blocker might sidestep onto a free side
+            # cell itself, but not onto a cell the retreating requester still has
+            # to use -- parking there only moves the blockage.
+            for side_cell in self._safe_side_cells(
+                current, occupied, reserved, forbidden=blocked_path
             ):
-                return True
-        if task is None:
-            # A taskless robot that still drives a remaining route never
-            # sidesteps off it -- not even to unblock a requester -- so a side
-            # cell cannot count as a way out for it.
-            return False
-        # Otherwise the task-bound blocker might sidestep onto a free side
-        # cell itself, but not onto a cell the retreating requester still has
-        # to use -- parking there only moves the blockage.
-        for side_cell in self._safe_side_cells(
-            blocker, occupied, reserved, forbidden=blocked_path
-        ):
-            if self._plan_route(blocker, task, start=side_cell) is not None:
-                return True
+                if self._plan_route(current, task, start=side_cell) is not None:
+                    return True
         return False
 
     def _update_traffic_waits(
