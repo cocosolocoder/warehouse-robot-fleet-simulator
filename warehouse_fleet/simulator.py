@@ -59,6 +59,24 @@ or task involved; nothing is rebound, unassigned or dropped, and the caller's
 objects are left untouched. The same unfinished-task binding rules govern
 checkpoint loading (which additionally keeps its historical-state checks).
 
+Every robot's remaining route is also validated as a walk on the given map,
+whether or not the robot is bound to a task. The route omits the robot's
+current cell, so a non-empty route must begin with an up/down/left/right
+neighbour of that cell and every later waypoint must be one orthogonal step
+from the previous one; each waypoint must be in bounds and free of obstacles.
+Diagonal steps, multi-cell jumps, two identical consecutive waypoints and a
+first waypoint equal to the current position are all rejected, and waypoints
+must be two plain integers (never booleans) in a list or tuple, with wrong
+lengths or element types raising :class:`ValueError` rather than leaking
+unpacking or hashing errors. Empty routes stay legal; a route need not be
+shortest and may revisit cells. A route crossing another robot's current cell,
+or several robots planning through the same cell, is not an error -- those
+traffic conflicts are settled during execution. The direct interface keeps
+its existing acceptance of a bound route's pickup/dropoff ordering and end
+point; checkpoint loading additionally keeps its own stricter route checks
+(including the task completion rules), its format and the map-paused
+behaviour, under which a paused robot resumes with an empty route.
+
 Checkpoint file format
 ----------------------
 ``save_checkpoint`` writes versioned, UTF-8 encoded JSON. The current format
@@ -267,6 +285,7 @@ class FleetSimulator:
         if any(not grid.traversable(position) for position in positions):
             raise ValueError("robot starts outside traversable map space")
         self._validate_task_ownership(robots, tasks)
+        self._validate_initial_routes(grid, robots)
 
     @staticmethod
     def _validate_task_ownership(robots: Sequence[Robot], tasks: Sequence[Task]) -> None:
@@ -336,6 +355,79 @@ class FleetSimulator:
                         f"task {task.task_id!r} claims robot {owner.robot_id!r} "
                         f"but the robot executes {owner.task_id!r}"
                     )
+
+    @staticmethod
+    def _validate_initial_routes(grid: GridMap, robots: Sequence[Robot]) -> None:
+        """Reject remaining routes that cannot be walked cell by cell.
+
+        Every robot is checked, idle or task-bound: a route carries no current
+        cell, so a non-empty route must begin with an orthogonal neighbour of
+        the robot's position and every later waypoint must be one orthogonal
+        step from the previous one. Diagonal moves, multi-cell jumps, two
+        identical consecutive waypoints and a first waypoint equal to the
+        current cell are all rejected, and every waypoint must lie inside the
+        map and outside its obstacles. Waypoints must be two plain integers in
+        a list or tuple -- booleans are not integers here, and wrong lengths or
+        element types raise :class:`ValueError` instead of leaking unpacking or
+        hashing failures.
+
+        Routes need not be shortest paths and may revisit cells, and traffic
+        (a route crossing another robot's cell, or routes sharing a cell) is
+        left to execution: only walkability on the given map is judged. The
+        check is read-only -- a rejected fleet is rejected as a whole, and the
+        caller's robot and task objects are never truncated, padded, reordered
+        or otherwise modified. Checkpoint loading keeps its own, stricter
+        validation that also covers the task pickup/dropoff rules.
+        """
+        for robot in robots:
+            route = robot.route
+            if not isinstance(route, (list, tuple)):
+                raise ValueError(
+                    f"robot {robot.robot_id!r} remaining route must be a list "
+                    "of [x, y] waypoints"
+                )
+            previous = robot.position
+            for index, cell in enumerate(route):
+                waypoint = _as_cell(
+                    cell, f"robot {robot.robot_id!r} route waypoint {index}"
+                )
+                if not grid.traversable(waypoint):
+                    raise ValueError(
+                        f"robot {robot.robot_id!r} route waypoint {index} "
+                        f"{list(waypoint)} is outside the map or inside an obstacle"
+                    )
+                if index == 0 and waypoint == previous:
+                    raise ValueError(
+                        f"robot {robot.robot_id!r} route waypoint 0 "
+                        f"{list(waypoint)} is the robot's current cell; the "
+                        "remaining route must start with the next cell"
+                    )
+                if waypoint == previous:
+                    raise ValueError(
+                        f"robot {robot.robot_id!r} route repeats cell "
+                        f"{list(waypoint)} at consecutive waypoints "
+                        f"{index - 1} and {index}"
+                    )
+                if (
+                    abs(waypoint[0] - previous[0])
+                    + abs(waypoint[1] - previous[1])
+                    != 1
+                ):
+                    if index == 0:
+                        segment = (
+                            f"from its current position {list(previous)} to "
+                            f"route waypoint 0 {list(waypoint)}"
+                        )
+                    else:
+                        segment = (
+                            f"from route waypoint {index - 1} {list(previous)} "
+                            f"to waypoint {index} {list(waypoint)}"
+                        )
+                    raise ValueError(
+                        f"robot {robot.robot_id!r} route moves non-adjacently "
+                        f"{segment}: every step must move one orthogonal cell"
+                    )
+                previous = waypoint
 
     # ------------------------------------------------------------------
     # Dynamic map edits
