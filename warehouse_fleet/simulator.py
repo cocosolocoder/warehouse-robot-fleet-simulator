@@ -20,7 +20,12 @@ a task-bound robot, is never pushed onto a side cell for someone else, and if
 its own next cell is blocked it simply keeps its place and its unconsumed
 waypoints -- an open side cell changes nothing. Only once such a route is
 exhausted does the robot become a parked robot and yield by the side-cell
-rule. A retreat that
+rule. Task assignment follows the same line: only a robot with no bound task
+*and* no remaining route can receive a waiting task, so a taskless robot
+still driving its preset route never has that route overwritten by a new
+assignment -- being blocked by traffic along the way does not count as having
+finished the route, and once the route runs out the robot joins the selection
+at the next assignment pass, planned from wherever it stands then. A retreat that
 only leads back to the same immovable blocker is never taken though: if the
 replanned route immediately returns through the vacated cell, still passes the
 blocker's cell and the blocker cannot use the opening to leave (a dead end or
@@ -924,12 +929,22 @@ class FleetSimulator:
     # ------------------------------------------------------------------
 
     def assign_tasks(self) -> None:
-        """Assign pending tasks to the nearest idle robot using stable tie breaks."""
+        """Assign pending tasks to the nearest available robot using stable tie breaks.
+
+        Only a robot with no bound task *and* no remaining route is available:
+        a taskless robot still driving a preset route keeps that route and is
+        never selected, even when it is the closest to the pickup -- being
+        temporarily blocked by traffic does not count as having finished the
+        route either. Skipping such a robot never touches its position,
+        mileage, cargo state or remaining waypoints, and never makes other
+        tasks wait: the next available robot is chosen by the usual shortest
+        feasible route length with the robot id string as tie break.
+        """
         pending = [task for task in self.tasks.values() if task.assigned_robot is None]
         for task in sorted(pending, key=lambda item: item.task_id):
             choices: list[tuple[int, str, list[tuple[int, int]]]] = []
             for robot in self.robots.values():
-                if not robot.idle:
+                if not robot.idle or robot.route:
                     continue
                 route = _plan_task_route(self.grid, robot.position, task)
                 if route is None:
