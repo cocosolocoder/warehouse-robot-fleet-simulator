@@ -30,7 +30,11 @@ only leads back to the same immovable blocker is never taken though: if the
 replanned route immediately returns through the vacated cell, still passes the
 blocker's cell and the blocker cannot use the opening to leave (a dead end or
 corridor end with traffic parked beyond it), the robot simply waits -- extra
-empty cells stretching out behind it change nothing. Yield moves count as
+empty cells stretching out behind it change nothing. Nor does the blocker's
+own side step automatically count as leaving: when that step only moves the
+blocker onto a side cell whose replanned route returns it onto the corridor
+to face the very same unyielding jam further ahead, the opening is no opening
+and the retreat behind it is rejected as well. Yield moves count as
 mileage, waiting does not. The task keeps its original robot, pickup and
 completion rules are unchanged, and a robot paused by map unreachability never
 takes part in yielding. If no safe side cell exists the robots simply wait:
@@ -954,6 +958,29 @@ class FleetSimulator:
             blocked_path,
         )
 
+    def _side_exit_cells(
+        self,
+        robot: Robot,
+        task: Task,
+        occupied: dict[Position, str],
+        reserved: dict[Position, str],
+        blocked_path: frozenset[Position],
+    ) -> Iterator[tuple[Position, list[Position]]]:
+        """Side cells a busy robot could escape to, with their replanned routes.
+
+        Only cells off every other robot's planned route that keep the robot's
+        task reachable are offered, in deterministic neighbour order. Whether
+        such a cell is a genuine way out -- or just moves the robot aside for
+        one tick before it is driven back onto the same blocked corridor -- is
+        judged by the caller as it scans the candidates.
+        """
+        for side_cell in self._safe_side_cells(
+            robot, occupied, reserved, forbidden=blocked_path
+        ):
+            route = self._plan_route(robot, task, start=side_cell)
+            if route is not None:
+                yield side_cell, route
+
     def _can_vacate(
         self,
         blocker: Robot,
@@ -981,20 +1008,42 @@ class FleetSimulator:
         such sidesteps do not count as leaving (driving on along the cell on
         the blocker's own route does).
 
+        A task-bound blocker's own side step is judged by the same standard as
+        the requester's retreat: it counts as leaving only when the replanned
+        route from the side cell does not lead straight back through the cell
+        being vacated into another robot that cannot get out of the way
+        either. A side cell the blocker must leave again on the next tick to
+        re-face the very same unyielding jam further down the corridor is no
+        way out, so it never justifies the retreat behind it.
+
         The follow chain can run through an arbitrarily long legal queue, so
         the search is an explicit stack rather than Python recursion: a queue
         of twelve hundred robots ending at a parked robot with no side cell
         must report "cannot vacate" from a normal ``step()`` instead of
         raising :class:`RecursionError`. Each frame is
-        ``(robot, checking, resume)``. A frame examined for the first time
-        first tries the free-waypoint and follow-chain rules; only when the
-        chain ahead comes back empty does it resume at its own side-cell
-        scan, which is exactly the order the single recursive call imposed.
+        ``(robot, occupied, checking, blocked_path, resume)``: a nested
+        hypothetical (the blocker having stepped aside) works with its own
+        layout and no-go cells, so both travel with the frame. *resume* is
+        ``None`` on a frame's first visit and afterwards holds the robot's
+        not-yet-tried side-exit candidates as a stateful iterator. A frame
+        examined for the first time first tries the free-waypoint and
+        follow-chain rules; only when the chain ahead comes back empty does it
+        resume at its own side-cell scan, continuing exactly where that scan
+        stopped -- the order the single recursive call imposed.
         """
-        stack: list[tuple[Robot, frozenset[str], bool]] = [(blocker, checking, False)]
+        frame = (blocker, occupied, checking, blocked_path, None)
+        stack: list[
+            tuple[
+                Robot,
+                dict[Position, str],
+                frozenset[str],
+                frozenset[Position],
+                Iterator[tuple[Position, list[Position]]] | None,
+            ]
+        ] = [frame]
         while stack:
-            current, current_checking, resume = stack.pop()
-            if current.robot_id in current_checking:
+            current, cur_occupied, cur_checking, cur_blocked_path, resume = stack.pop()
+            if current.robot_id in cur_checking:
                 # The chain has folded back onto a robot it already depends
                 # on: a cycle cannot vacate itself. The frame that followed
                 # this one simply resumes with its own side-cell options.
@@ -1013,37 +1062,58 @@ class FleetSimulator:
                 # particular cell sits on the path the retreating requester must
                 # re-enter, parking there only relocates the blockage instead of
                 # clearing it, so it does not count as leaving.
-                side = self._idle_sidestep_cell(current, requester, occupied, reserved)
-                if side is not None and side not in blocked_path:
+                side = self._idle_sidestep_cell(current, requester, cur_occupied, reserved)
+                if side is not None and side not in cur_blocked_path:
                     return True
                 continue
-            if not resume:
+            if resume is None:
                 ahead = current.route[0]
                 if (
                     self.grid.traversable(ahead)
-                    and ahead not in occupied
+                    and ahead not in cur_occupied
                     and ahead not in reserved
                 ):
                     return True
-                occupant_id = occupied.get(ahead) or reserved.get(ahead)
+                occupant_id = cur_occupied.get(ahead) or reserved.get(ahead)
                 if (
                     occupant_id is not None
                     and occupant_id != current.robot_id
-                    and occupant_id not in current_checking
+                    and occupant_id not in cur_checking
                 ):
                     # The robot could follow the occupant once that robot
                     # vacates its cell this same tick. This frame resumes with
                     # its side-cell scan only after the chain ahead proves it
                     # cannot clear, mirroring the recursive call order.
-                    stack.append((current, current_checking, True))
+                    stack.append(
+                        (
+                            current,
+                            cur_occupied,
+                            cur_checking,
+                            cur_blocked_path,
+                            self._side_exit_cells(
+                                current, task, cur_occupied, reserved, cur_blocked_path
+                            )
+                            if task is not None
+                            else iter(()),
+                        )
+                    )
                     stack.append(
                         (
                             self.robots[occupant_id],
-                            current_checking | {current.robot_id},
-                            False,
+                            cur_occupied,
+                            cur_checking | {current.robot_id},
+                            cur_blocked_path,
+                            None,
                         )
                     )
                     continue
+                resume = (
+                    self._side_exit_cells(
+                        current, task, cur_occupied, reserved, cur_blocked_path
+                    )
+                    if task is not None
+                    else iter(())
+                )
             if task is None:
                 # A taskless robot that still drives a remaining route never
                 # sidesteps off it -- not even to unblock a requester -- so a side
@@ -1052,11 +1122,47 @@ class FleetSimulator:
             # Otherwise the task-bound blocker might sidestep onto a free side
             # cell itself, but not onto a cell the retreating requester still has
             # to use -- parking there only moves the blockage.
-            for side_cell in self._safe_side_cells(
-                current, occupied, reserved, forbidden=blocked_path
-            ):
-                if self._plan_route(current, task, start=side_cell) is not None:
+            chained = False
+            for side_cell, route in resume:
+                if not route or route[0] != current.position:
+                    # A genuine exit: the robot drives on elsewhere instead of
+                    # returning onto the cell it just vacated.
                     return True
+                # The replanned route leads straight back through the cell
+                # being vacated. That still counts as leaving when the way
+                # back is clear, or when whoever holds it can clear out in
+                # turn -- but not when the robot would re-face a jam that has
+                # no exit of its own, because then the side step is undone on
+                # the next tick with nothing gained.
+                hyp_occupied = dict(cur_occupied)
+                del hyp_occupied[current.position]
+                hyp_occupied[side_cell] = current.robot_id
+                holder_id: str | None = None
+                for cell in route[1:]:
+                    holder = hyp_occupied.get(cell) or reserved.get(cell)
+                    if holder is not None and holder != current.robot_id:
+                        holder_id = holder
+                        break
+                if holder_id is None:
+                    return True
+                if holder_id in cur_checking:
+                    continue
+                stack.append(
+                    (current, cur_occupied, cur_checking, cur_blocked_path, resume)
+                )
+                stack.append(
+                    (
+                        self.robots[holder_id],
+                        hyp_occupied,
+                        cur_checking | {current.robot_id},
+                        frozenset(route),
+                        None,
+                    )
+                )
+                chained = True
+                break
+            if chained:
+                continue
         return False
 
     def _update_traffic_waits(
