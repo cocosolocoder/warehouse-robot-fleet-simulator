@@ -23,6 +23,102 @@ python3 -m unittest discover -s tests -v
 The public Python API exposes `GridMap`, `Robot`, `Task`, `FleetSimulator`, and
 `shortest_path` for programmatic scenarios.
 
+## Taking over work already in progress
+
+A fleet does not have to start idle. `FleetSimulator` accepts robots that are
+already carrying goods partway along a route, together with their in-flight
+tasks and any completed-task history, and continues the work from there:
+
+```python
+from warehouse_fleet import FleetSimulator, GridMap, Robot, Task
+
+grid = GridMap(3, 3, obstacles=frozenset({(1, 0)}))
+
+# R-1 collected T-1's goods earlier and is halfway to the dropoff. The
+# remaining route lists the cells still ahead, next cell first; it heads
+# straight to the dropoff and never returns to the pickup cell.
+carrier = Robot(
+    "R-1",
+    position=(0, 0),
+    route=[(0, 1), (1, 1), (2, 1), (2, 0)],
+    task_id="T-1",
+    distance_travelled=5,      # mileage already on the clock
+)
+in_flight = Task(
+    "T-1",
+    pickup=(0, 2),
+    dropoff=(2, 0),
+    assigned_robot="R-1",      # must name the carrier back
+    picked_up=True,            # goods already collected
+)
+# A finished delivery kept as history. The robot that completed it may be
+# retired, absent from this fleet, or busy with a new task.
+history = Task(
+    "T-0",
+    pickup=(1, 2),
+    dropoff=(2, 2),
+    assigned_robot="R-9",      # historical record; R-9 is not in this fleet
+    picked_up=True,
+    completed=True,
+)
+
+simulator = FleetSimulator(grid, [carrier], [in_flight, history])
+
+# Creation itself changes nothing: the clock is zero, the replay is empty,
+# the robot has not moved, and the mileage and completion marks it came
+# with are kept exactly as passed in.
+assert simulator.tick == 0 and simulator.replay == []
+assert carrier.position == (0, 0) and carrier.distance_travelled == 5
+assert history.completed
+
+for _ in range(4):             # one tick per step(); each actual move adds
+    simulator.step()           # exactly one cell of mileage
+
+assert carrier.position == (2, 0)      # route exhausted at the dropoff
+assert carrier.distance_travelled == 9 # 5 kept + 4 cells driven
+assert carrier.task_id is None         # delivery released the binding
+assert in_flight.completed and in_flight.assigned_robot == "R-1"
+
+simulator.metrics()
+# {"ticks": 4, "tasks_total": 2, "tasks_completed": 2, ...}
+# tasks_completed counts the preserved T-0 record as well as T-1.
+```
+
+Ownership of in-flight work is mutual: a robot's `task_id` must name an
+existing, unfinished task whose `assigned_robot` names that robot back, and a
+task whose goods are already collected (`picked_up=True`) may never lack its
+carrier. Completed tasks are fixed historical records, not work in progress:
+each must keep both the picked-up mark and the id of the robot that finished
+it, but that robot is bound by nothing — it may be missing from the fleet,
+idle, or already executing another task, and several records may name the
+same robot. History never takes part in new task assignment and never
+occupies a robot, while its completions still count in `metrics()`.
+
+The remaining route describes a walk from the robot's current cell: the first
+waypoint is the *next* cell (never the current one), every later waypoint is
+exactly one orthogonal step from the previous one, and every waypoint lies
+inside the map and outside the initial obstacles. Legal detours and revisits
+of already-seen cells are fine; the route need not be shortest. The two entry
+points judge a route differently: direct construction only checks that the
+walk is legal — it never plans or pads the pickup and delivery legs for you —
+while checkpoint loading additionally requires every in-flight task to be
+completable along its robot's remaining route. Either way, accepting the
+input is not a promise that the task will finish: hand in a route that
+actually reaches the dropoff, as the example does, and the robot will drive
+those cells in order, complete the task on arrival, and release the binding
+while the task keeps its robot's id.
+
+Inconsistent input is rejected at construction time with a `ValueError`
+naming the robot or task involved — a robot bound to an unknown or already
+completed task, a task claiming a robot that executes something else, a
+collected task with no carrier, or a completion record missing its picked-up
+mark or historical robot. A rejected fleet commits nothing: every robot and
+task the caller passed in is left exactly as it was. The same ownership and
+completed-history rules govern checkpoint loading, so a fleet one entry point
+accepts is always a state the other can reload, and the in-flight robots
+behave like any other fleet under map edits, traffic yielding, and
+save/restore.
+
 ## Closing and reopening cells at runtime
 
 Between ticks you may change the map with one batch call. The edit takes effect
