@@ -189,6 +189,141 @@ dropoff, and a robot that has not collected yet must still pass the pickup).
 Fleets built through either entry point then behave identically: map edits,
 yielding and save/restore apply to them exactly as described below.
 
+## Assigning tasks to robots
+
+`FleetSimulator.assign_tasks()` binds waiting tasks to available robots. It is
+also called once inside every `step()`, so a fleet left to run assigns work on
+its own; call it directly when you want to assign (or inspect an assignment)
+without advancing the simulation.
+
+**Which tasks are considered.** Only tasks with no `assigned_robot` are
+pending — assigned, loaded and completed tasks never re-enter assignment.
+Pending tasks are processed one at a time in the **string order of their task
+ids**: this is plain lexicographic text ordering, so `"T-10"` sorts before
+`"T-2"` (the digits inside an id are not interpreted as a number), and the
+order is well-defined only because task ids are unique within a fleet.
+
+**Which robots are available.** A robot must have no bound task *and* no
+remaining route. A taskless robot still driving a preset route is skipped —
+even when it sits closest to the pickup — and keeps its waypoints, position,
+mileage and cargo state untouched; only once that route is exhausted does the
+robot join the selection at the next assignment pass, planned from wherever
+it stands then. Being briefly blocked by traffic does not count as having
+finished the route either.
+
+**How the winner is chosen.** For each task, in turn, every available robot
+plans a shortest feasible route on the *current* map from its own cell through
+the pickup point to the dropoff point, and the robot with the shortest such
+route wins. The measure is the length of an actual walkable path around
+obstacles — never the straight-line distance between coordinates — so a robot
+that looks nearer to the pickup can lose to one with a clear corridor. Equal
+route lengths are broken by robot id in string order. Because tasks are
+processed one by one, a robot bound to an earlier task is no longer available
+for the next task of the same pass: this is greedy per-task assignment, not a
+batch plan that minimizes the fleet's total travel.
+
+**When no robot qualifies, the task simply waits.** If no available robot can
+walk the full pickup-then-dropoff route, the task keeps `assigned_robot=None`,
+occupies no robot, and does not prevent later tasks in the same pass from
+being assigned. A task whose pickup is reachable but whose dropoff is not is
+treated exactly the same — it is *not* assigned first in the hope that the
+dropoff opens up later; the whole route must be feasible at assignment time.
+(Separately, a robot paused by a map edit keeps its task; see
+`status()["paused_tasks"]`.)
+
+**What the route looks like.** The planned route stored on the robot omits
+the robot's current cell and starts with the next cell to enter. A robot not
+yet standing on the pickup point gets a route that passes through the pickup
+and ends at the dropoff; a robot already on the pickup cell gets only the
+dropoff leg. The route is a plan, not a promise of immediate execution.
+
+**Assignment changes no physics.** `assign_tasks()` itself only sets
+`task.assigned_robot`, `robot.task_id` and `robot.route`. It does not advance
+the clock, move any robot, add mileage, or mark anything picked up or
+completed — not even for a robot already standing on its pickup cell. The
+pickup and delivery rules run inside `step()`: at the start of each tick a
+robot standing on its pickup point collects the goods first and then drives,
+and each cell actually entered adds one to `distance_travelled`.
+
+### A complete assignment example
+
+```python
+from warehouse_fleet import FleetSimulator, GridMap, Robot, Task
+
+#       x=0     x=1     x=2     x=3     x=4
+# y=0   .       R-1     #       T-01 pk .
+# y=1   T-02 dr .       #       T-01 dr .
+# y=2   R-3     .       T-03 pk .       R-2
+# T-02 picks up where R-1 stands; T-03's dropoff is the obstacle (2, 0).
+grid = GridMap(width=5, height=3, obstacles=frozenset({(2, 0), (2, 1)}))
+
+robots = [
+    Robot("R-1", position=(1, 0)),
+    Robot("R-2", position=(4, 2)),
+    # No task, but still driving a preset route: not available yet.
+    Robot("R-3", position=(0, 2), route=[(1, 2)]),
+]
+tasks = [
+    Task("T-01", pickup=(3, 0), dropoff=(3, 1)),
+    Task("T-02", pickup=(1, 0), dropoff=(0, 1)),
+    Task("T-03", pickup=(2, 2), dropoff=(2, 0)),  # dropoff unreachable
+]
+
+simulator = FleetSimulator(grid, robots, tasks)
+simulator.assign_tasks()
+```
+
+R-1 sits two straight-line cells from T-01's pickup while R-2 is three away,
+yet the wall at column 2 forces R-1 to detour six steps to reach `(3, 0)`
+(plus one to the dropoff, seven in total), while R-2 walks `(4, 2) → (4, 1) →
+(4, 0) → (3, 0)` and on to the dropoff in four. Feasible route length, not
+straight-line distance, decides, so T-01 goes to R-2. T-02 is processed next:
+R-2 is now bound, R-3 is still driving its preset route and is skipped, so
+R-1 — already standing on the pickup cell — takes it with only the dropoff
+leg to drive. T-03's dropoff is the obstacle cell `(2, 0)`: no robot can
+finish that route, so T-03 stays unassigned without blocking anything. Right
+after `assign_tasks()` the clock is still zero, nothing has moved, no mileage
+has accrued and no goods are marked collected — only ownership and routes
+exist:
+
+```python
+simulator.tick                              # 0
+simulator.tasks["T-01"].assigned_robot      # 'R-2'
+simulator.tasks["T-02"].assigned_robot      # 'R-1'
+simulator.tasks["T-03"].assigned_robot      # None — waits, blocks nothing
+simulator.robots["R-2"].task_id             # 'T-01'
+simulator.robots["R-2"].route               # [(4, 1), (4, 0), (3, 0), (3, 1)]
+simulator.robots["R-1"].route               # [(0, 0), (0, 1)] — pickup leg empty
+simulator.robots["R-3"].route               # [(1, 2)] — preset route untouched
+simulator.robots["R-2"].distance_travelled  # 0
+simulator.tasks["T-02"].picked_up           # False — not collected by assigning
+```
+
+R-2's route starts at the cell after its position, passes the pickup `(3, 0)`
+and ends at the dropoff `(3, 1)` — checkable against the map above. Only
+`step()` advances the world: at the start of the tick R-1, already on its
+pickup cell, collects T-02's goods before driving off, and every robot
+drives one route cell (or waits):
+
+```python
+simulator.step()
+simulator.tick                              # 1
+simulator.tasks["T-02"].picked_up           # True — collected before driving
+simulator.robots["R-1"].position            # (0, 0)
+simulator.robots["R-1"].distance_travelled  # 1
+simulator.robots["R-2"].position            # (4, 1) — one route cell per tick
+simulator.robots["R-3"].position            # (1, 2) — preset route now finished
+
+simulator.step()
+simulator.tasks["T-02"].completed           # True — R-1 reached (0, 1) and released
+simulator.robots["R-1"].task_id             # None
+```
+
+With its preset route exhausted after the first step, R-3 is available at the
+next assignment pass — here only the unreachable T-03 is left, so it stays
+idle; had a reachable task been waiting, that pass would have considered R-3
+from `(1, 2)` like any other free robot.
+
 ## Closing and reopening cells at runtime
 
 Between ticks you may change the map with one batch call. The edit takes effect
