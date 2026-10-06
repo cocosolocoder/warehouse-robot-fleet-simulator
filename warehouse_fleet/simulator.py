@@ -1936,29 +1936,62 @@ class FleetSimulator:
                 )
 
     @classmethod
-    def _load_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
+    def _replay_frame_entries(
+        cls, data: Mapping[str, object]
+    ) -> Iterator[tuple[int, dict[str, object]]]:
+        """Yield ``(index, frame)`` pairs from the checkpoint's replay list.
+
+        This is the single place that owns the container rules every format
+        version applies identically: the ``replay`` field must be a list and
+        every entry in it must be an object. What a frame may contain beyond
+        that -- which event types exist and how each is read in -- stays with
+        the per-version loaders.
+        """
         raw = cls._require_field(data, "replay")
         if not isinstance(raw, list):
             raise ValueError("checkpoint field 'replay' must be a list")
+        for index, frame in enumerate(raw):
+            if not isinstance(frame, dict):
+                raise ValueError(f"replay frame {index} must be an object")
+            yield index, frame
+
+    @classmethod
+    def _validate_tick_frame(
+        cls, frame: Mapping[str, object], index: int, tick_index: int
+    ) -> None:
+        """Validate one normal replay tick frame against the shared rules.
+
+        A normal frame records one finished simulation step, so its ``tick``
+        must be an integer numbering the frames consecutively from 1 (map
+        changes sit between steps and consume no number, which is why the
+        caller passes the running *tick_index* rather than the list position),
+        and its ``moved``/``completed``/``robots`` payload must satisfy the
+        single content rule in :meth:`_validate_tick_frame_payload`. Both
+        format versions judge their tick frames exactly this way, so the rule
+        lives here once; the versions differ only in which other event types
+        they accept and how an accepted frame is stored.
+        """
+        frame_tick = frame.get("tick")
+        if not _is_int(frame_tick):
+            raise ValueError(f"replay frame {index} field 'tick' must be an integer")
+        if frame_tick != tick_index:
+            raise ValueError(
+                "replay tick numbers must run consecutively from 1; frame "
+                f"{index} has tick {frame_tick}, expected {tick_index}"
+            )
+        cls._validate_tick_frame_payload(frame, frame_tick)
+
+    @classmethod
+    def _load_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
         replay: list[dict[str, object]] = []
         tick_index = 0
         last_map_tick = -1
         last_map_sequence = 0
-        for index, frame in enumerate(raw):
-            if not isinstance(frame, dict):
-                raise ValueError(f"replay frame {index} must be an object")
+        for index, frame in cls._replay_frame_entries(data):
             frame_type = frame.get("type", "tick")
             if frame_type == "tick":
                 tick_index += 1
-                frame_tick = frame.get("tick")
-                if not _is_int(frame_tick):
-                    raise ValueError(f"replay frame {index} field 'tick' must be an integer")
-                if frame_tick != tick_index:
-                    raise ValueError(
-                        "replay tick numbers must run consecutively from 1; frame "
-                        f"{index} has tick {frame_tick}, expected {tick_index}"
-                    )
-                cls._validate_tick_frame_payload(frame, frame_tick)
+                cls._validate_tick_frame(frame, index, tick_index)
                 replay.append(frame)
             elif frame_type == "map_change":
                 tick = frame.get("tick")
@@ -2020,25 +2053,14 @@ class FleetSimulator:
 
     @classmethod
     def _load_legacy_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
-        raw = cls._require_field(data, "replay")
-        if not isinstance(raw, list):
-            raise ValueError("checkpoint field 'replay' must be a list")
         replay: list[dict[str, object]] = []
-        for index, frame in enumerate(raw):
-            if not isinstance(frame, dict):
-                raise ValueError(f"replay frame {index} must be an object")
+        for index, frame in cls._replay_frame_entries(data):
             frame_type = frame.get("type", "tick")
             if frame_type != "tick":
                 raise ValueError("version 1 checkpoints cannot contain map change frames")
-            frame_tick = frame.get("tick")
-            if not _is_int(frame_tick):
-                raise ValueError(f"replay frame {index} field 'tick' must be an integer")
-            if frame_tick != index + 1:
-                raise ValueError(
-                    "replay tick numbers must run consecutively from 1; frame "
-                    f"{index} has tick {frame_tick}, expected {index + 1}"
-                )
-            cls._validate_tick_frame_payload(frame, frame_tick)
+            # Version 1 has no map-change events, so the list position is the
+            # tick number; the tick-frame rule itself is the shared one.
+            cls._validate_tick_frame(frame, index, index + 1)
             normalized = dict(frame)
             normalized["type"] = "tick"
             replay.append(normalized)
