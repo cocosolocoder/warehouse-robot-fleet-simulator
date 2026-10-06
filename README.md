@@ -118,6 +118,42 @@ FleetSimulator(grid, [carrier, stray], [in_flight, history])
 # ValueError: robot 'R-2' executes task 'T-0' that is already completed
 ```
 
+### Unique robot and task ids
+
+Every robot id may occur exactly once in the robot list and every task id
+exactly once in the task list; uniqueness is judged on the id alone within
+each list. Two robots sharing an id (even at different positions), two tasks
+sharing an id (even with different pickup/dropoff points or one finished while
+the other still waits), and even the very same record passed in twice all
+reject the whole request with `ValueError`, naming whether a robot or a task
+id collided and the id itself:
+
+```python
+FleetSimulator(
+    grid,
+    [Robot("R-1", (0, 0)), Robot("R-1", (7, 0))],
+    [],
+)
+# ValueError: duplicate robot id 'R-1' in fleet creation request: each robot
+# id may appear at most once in the robot list
+```
+
+No record is silently kept, merged with its twin, or auto-renamed, and the
+outcome never depends on whether the robot is idle, carries a preset route, or
+is mid-delivery. The check runs before anything else is validated or
+normalized, so rejection leaves every `Robot` and `Task` object exactly as
+passed in — positions, remaining routes (including their list containers),
+points, bindings, mileage and flags — even when the duplicate is the last item
+and earlier records were already examined.
+
+The robot and task lists have independent id spaces: a robot and a task may
+use the same string, a task's `assigned_robot` is only a reference (never a
+second robot record), and several completed tasks may name the same finishing
+robot, including one absent from the fleet. Tasks with different ids but
+identical pickup and dropoff are distinct tasks: both are kept, assigned and
+counted separately. Checkpoint files keep rejecting duplicate ids just as
+before; the file format is unchanged.
+
 ### Task coordinates
 
 Every task's `pickup` and `dropoff` must be a list or tuple holding exactly

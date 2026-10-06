@@ -82,6 +82,25 @@ are left untouched. The very same ownership and completed-history rules
 govern checkpoint loading, so a completion record one entry point accepts
 can never be a record the other cannot reload.
 
+Each robot id may appear exactly once in the robot list and each task id
+exactly once in the task list; uniqueness is judged within each list on the id
+alone. Two records naming the same id -- even byte-for-byte identical records,
+or one finished task beside a still-waiting twin -- always reject the whole
+batch with :class:`ValueError` naming whether a robot or a task id collided
+and the id itself: nothing keeps one record, merges fields or auto-renames
+either one, and the rule never depends on whether a robot is idle, carries a
+preset route or is mid-delivery. Uniqueness is checked before anything is
+normalized and before any other content validation, so the duplicate is
+reported outright and every earlier object keeps its original position,
+remaining route, points, binding, mileage and containers. The two lists have
+independent id spaces: a robot and a task may share one string, a task's
+``assigned_robot`` is only a reference rather than a second robot record, and
+several finished tasks may name the same historical robot even when that
+robot is absent from the fleet; tasks whose ids differ but whose pickup and
+dropoff coincide are separate tasks and both take part in assignment and
+completion statistics. Checkpoint loading keeps its own, equally strict
+duplicate-id rejection with its existing wording and unchanged file format.
+
 Every task's pickup point and dropoff is validated with the very same strict
 coordinate rule as robot positions (:func:`_as_cell`): each must be a list or
 tuple holding exactly two plain integers, and the two spellings may be mixed
@@ -312,6 +331,7 @@ import os
 import tempfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
+from typing import TypeVar
 
 from .model import GridMap, Position, Robot, Task
 from .pathfinding import shortest_path
@@ -371,6 +391,33 @@ def _as_cell(value: object, description: str) -> Position:
 def _as_pair(value: object, description: str) -> tuple[int, int]:
     """Validate a checkpoint coordinate as a two-integer JSON list."""
     return _coordinate_pair(value, description, strict_list=True)
+
+
+_EntityT = TypeVar("_EntityT", Robot, Task)
+
+
+def _unique_index(items: Sequence[_EntityT], kind: str) -> dict[str, _EntityT]:
+    """Build an id-to-entity index, rejecting a repeated id outright.
+
+    Each robot id may occur exactly once in the robot batch and each task id
+    exactly once in the task batch: two entries naming the same id -- even
+    byte-for-byte identical records, or one finished task beside a waiting
+    twin -- are always a conflict, never an invitation to keep one record,
+    merge fields or auto-rename either one. The rule judges nothing but the
+    id, so an entity's state (idle, carrying a preset route, busy delivering,
+    completed, ...) never changes the outcome. The check is read-only: it
+    builds a fresh dict and never touches the supplied objects.
+    """
+    index: dict[str, _EntityT] = {}
+    for item in items:
+        entity_id = item.robot_id if isinstance(item, Robot) else item.task_id
+        if entity_id in index:
+            raise ValueError(
+                f"duplicate {kind} id {entity_id!r} in fleet creation request: "
+                f"each {kind} id may appear at most once in the {kind} list"
+            )
+        index[entity_id] = item
+    return index
 
 
 def _task_route_waypoints(origin: Position, task: Task) -> list[Position]:
@@ -569,10 +616,20 @@ class FleetSimulator:
         # :meth:`_normalize_initial_routes`: all robots and tasks stay exactly
         # as the caller passed them until the whole batch -- positions, task
         # points, overlaps, ownership and routes -- has passed.
+        # Uniqueness is enforced first, before positions, task points and
+        # routes are even examined: a repeated robot id or task id rejects the
+        # whole request with the id named, instead of silently dropping the
+        # earlier record (a dict comprehension used to keep only the last one)
+        # or failing with an unrelated content error on the second record.
+        # _validate_task_ownership indexes the very same lists through the same
+        # helper, so its ownership lookup can never collapse duplicates either.
+        # The two namespaces are independent: a robot and a task may share one
+        # string, and a task's owner is only a reference, never a second robot
+        # record.
+        self.robots = _unique_index(robots, "robot")
+        self.tasks = _unique_index(tasks, "task")
         normalized_positions = self._normalize_start_positions(grid, robots)
         normalized_task_points = self._normalize_task_coordinates(tasks)
-        self.robots = {robot.robot_id: robot for robot in robots}
-        self.tasks = {task.task_id: task for task in tasks}
         self.tick = 0
         self.replay: list[dict[str, object]] = []
         self.map_changes: list[dict[str, object]] = []
@@ -742,8 +799,8 @@ class FleetSimulator:
         inconsistent input is rejected as a whole, leaving the caller's objects
         untouched.
         """
-        robot_by_id = {robot.robot_id: robot for robot in robots}
-        task_by_id = {task.task_id: task for task in tasks}
+        robot_by_id = _unique_index(robots, "robot")
+        task_by_id = _unique_index(tasks, "task")
         for robot in robots:
             if robot.task_id is None:
                 continue
