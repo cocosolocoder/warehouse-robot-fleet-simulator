@@ -200,7 +200,17 @@ obstacles, make non-adjacent moves, or cannot complete the robot's bound task,
 task/robot ownership mismatches, a broken replay history, out-of-bounds or
 add/remove-conflicting change records,
 a change history that does not reproduce the saved grid, and an inconsistent
-paused-task state are all rejected. So is a replay whose *history* could never
+paused-task state are all rejected. One state is accepted instead of treated
+as an illegal route: in a version 2 file a robot **without a bound task** may
+keep waypoints that were traversable on the initial map, were later closed by
+a valid recorded map change, and are still closed when saved — the normal
+"drove up to the closure and is waiting there" state of a preset route. Such
+a waypoint is still shape-, bounds- and adjacency-checked; the robot's own
+position may never be on an obstacle; an obstacle already present on
+`base_grid` (one the edit history cannot explain) and every blocked waypoint
+in a version 1 file (which has no history) are rejected as before, and so are
+task-bound routes crossing a current obstacle. Direct fleet construction is
+unchanged: a route through an initial obstacle is always rejected. So is a replay whose *history* could never
 have happened, even when its final frame matches the saved robots: a robot out
 of bounds or on an obstacle that existed at that tick, two robots sharing a
 cell at a tick boundary, a jump of more than one orthogonal cell or a two-robot

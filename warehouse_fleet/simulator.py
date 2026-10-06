@@ -89,7 +89,16 @@ traffic conflicts are settled during execution. The direct interface keeps
 its existing acceptance of a bound route's pickup/dropoff ordering and end
 point; checkpoint loading additionally keeps its own stricter route checks
 (including the task completion rules), its format and the map-paused
-behaviour, under which a paused robot resumes with an empty route.
+behaviour, under which a paused robot resumes with an empty route. The single
+exception checkpoint recovery alone may grant is the dynamic-obstacle waiting
+exemption: a robot with no bound task in a version 2 document may name a
+waypoint that is blocked on the saved map only when that cell was open on the
+initial map and the validated change history has net-closed it and keeps it
+closed -- the checkpoint image of a taskless preset route held up at a
+runtime closure, which keeps its unvisited waypoints and waits. Direct
+construction never grants it, version 1 files (no history) never receive it,
+and it changes none of the shape, bounds, adjacency, current-position or
+task-route rules described above.
 
 Checkpoint file format
 ----------------------
@@ -173,7 +182,13 @@ mismatches, routes that cannot finish the robot's bound task, traffic waits
 that contradict the saved robot positions and remaining routes, broken replay
 or map-change history, a completion history that contradicts the saved task
 states, and a history that does not reproduce the saved grid all raise
-:class:`ValueError`.
+:class:`ValueError`. A version 2 document grants one narrow exemption: a
+robot with no bound task may keep route waypoints sitting on cells that were
+open in ``base_grid`` and are blocked in ``grid`` solely because the recorded
+history net-closed them (and still has them closed) -- the saved image of a
+preset route waiting at a dynamic closure. The exemption never covers the
+robot's current cell, out-of-bounds or malformed waypoints, non-adjacent
+steps, initial-map obstacles, version 1 files, or a task-bound route.
 
 A task-bound route is judged against the task's pickup state, not just for
 walkability. For every assigned, unfinished task that is not paused by map
@@ -327,6 +342,7 @@ def _validate_route_walk(
     *,
     robot_id: str,
     checkpoint: bool,
+    allowed_closed: frozenset[Position] = frozenset(),
 ) -> list[Position]:
     """Validate one robot's remaining route as a cell-by-cell map walk.
 
@@ -335,7 +351,13 @@ def _validate_route_walk(
     never edited twice. A route holds the cells still ahead of *origin*:
 
     * every waypoint must parse as two plain integers (booleans are rejected),
-      lie inside the map and outside its obstacles;
+      lie inside the map and outside its obstacles -- except that a waypoint
+      naming a cell in *allowed_closed* may sit on a current obstacle. That
+      exemption is reserved for checkpoint recovery of a taskless robot whose
+      preset route is held up by a cell a validated map edit has closed since
+      the fleet was built (and which is still closed); the shape, bounds and
+      adjacency rules below apply to such a waypoint unchanged, and direct
+      construction never passes an exemption;
     * the first waypoint must be an up/down/left/right neighbour of *origin*,
       so a first waypoint equal to the current cell is rejected;
     * every later waypoint must be exactly one orthogonal step from the
@@ -370,7 +392,9 @@ def _validate_route_walk(
             waypoint = _as_cell(
                 cell, f"robot {robot_id!r} route waypoint {index}"
             )
-        if not grid.traversable(waypoint):
+        if not grid.contains(waypoint) or (
+            waypoint in grid.obstacles and waypoint not in allowed_closed
+        ):
             if checkpoint:
                 raise ValueError(
                     f"robot {robot_id!r} route entry {list(waypoint)} is "
@@ -428,7 +452,14 @@ def _validate_route_walk(
 
 
 class FleetSimulator:
-    def __init__(self, grid: GridMap, robots: list[Robot], tasks: list[Task]) -> None:
+    def __init__(
+        self,
+        grid: GridMap,
+        robots: list[Robot],
+        tasks: list[Task],
+        *,
+        _allowed_closed_routes: Mapping[str, frozenset[Position]] | None = None,
+    ) -> None:
         self.grid = grid
         # The map as built before any runtime edit; map-change history is
         # replayed against this baseline.
@@ -454,7 +485,9 @@ class FleetSimulator:
         # committed only after every robot passed validation, so a rejection
         # (even one buried in a later robot's route) never touches the caller's
         # objects. See :meth:`_normalize_initial_routes`.
-        normalized_routes = self._normalize_initial_routes(grid, robots)
+        normalized_routes = self._normalize_initial_routes(
+            grid, robots, allowed_closed_routes=_allowed_closed_routes or {}
+        )
         for robot, route in zip(robots, normalized_routes):
             robot.route = route
 
@@ -529,7 +562,10 @@ class FleetSimulator:
 
     @staticmethod
     def _normalize_initial_routes(
-        grid: GridMap, robots: Sequence[Robot]
+        grid: GridMap,
+        robots: Sequence[Robot],
+        *,
+        allowed_closed_routes: Mapping[str, frozenset[Position]] | None = None,
     ) -> list[list[Position]]:
         """Validate every remaining route and return normalized copies.
 
@@ -551,15 +587,23 @@ class FleetSimulator:
         another robot's cell, or routes sharing a cell) is left to execution:
         only walkability on the given map is judged.
 
-        The check is read-only -- :func:`_validate_route_walk` builds fresh
-        lists, and the caller commits them itself only once every robot has
-        passed, so a rejected fleet is rejected as a whole: an error on a
-        later robot or at the end of a route never truncates, pads, reorders
-        or otherwise modifies an earlier robot or any caller object. The
-        shared walk check says nothing about tasks; direct construction keeps
-        accepting any walkable route, while checkpoint loading keeps its own
-        stricter validation that also covers the pickup/dropoff rules.
+        *allowed_closed_routes* is a private checkpoint-recovery-only map:
+        robot id -> cells currently blocked that this robot's remaining route
+        may nonetheless name (a taskless robot waiting out a dynamically
+        closed waypoint). Direct construction omits it, so a route through an
+        initial obstacle is rejected there exactly as before, and a robot id
+        absent from the map -- including every task-bound robot -- gets no
+        exemption. The check is read-only -- :func:`_validate_route_walk`
+        builds fresh lists, and the caller commits them itself only once
+        every robot has passed, so a rejected fleet is rejected as a whole:
+        an error on a later robot or at the end of a route never truncates,
+        pads, reorders or otherwise modifies an earlier robot or any caller
+        object. The shared walk check says nothing about tasks; direct
+        construction keeps accepting any walkable route, while checkpoint
+        loading keeps its own stricter validation that also covers the
+        pickup/dropoff rules.
         """
+        exemptions = allowed_closed_routes or {}
         normalized: list[list[Position]] = []
         for robot in robots:
             route = robot.route
@@ -575,6 +619,7 @@ class FleetSimulator:
                     route,
                     robot_id=robot.robot_id,
                     checkpoint=False,
+                    allowed_closed=exemptions.get(robot.robot_id, frozenset()),
                 )
             )
         return normalized
@@ -1399,6 +1444,13 @@ class FleetSimulator:
             cls._validate_map_history(base_grid, grid, map_changes)
 
         robots: list[Robot] = []
+        # Cells closed by the validated edit history and still closed when
+        # saved -- exactly the set of obstacles a taskless robot's remaining
+        # route may legitimately still name while it waits for the way to
+        # reopen. It is empty for version 1 (whose grid is its own baseline)
+        # and never covers an initial obstacle: such cells are in both maps.
+        dynamic_obstacles = frozenset(grid.obstacles) - frozenset(base_grid.obstacles)
+        allowed_closed_routes: dict[str, frozenset[Position]] = {}
         for record in robot_records:
             position = _as_pair(record["position"], f"robot {record['robot_id']!r} position")
             if not grid.traversable(position):
@@ -1406,6 +1458,15 @@ class FleetSimulator:
                     f"robot {record['robot_id']!r} position {list(position)} is outside "
                     "the map or inside an obstacle"
                 )
+            # Only a robot with no bound task may keep waypoints a map edit
+            # has closed: bound robots are rerouted or paused when their task
+            # becomes unreachable, so their routes are judged against the
+            # current map in full. The waiting exemption never excuses the
+            # robot's current cell, an out-of-map waypoint, malformed
+            # coordinates or a jump -- the shared walk check keeps those.
+            allowed_closed = (
+                dynamic_obstacles if record["task_id"] is None else frozenset()
+            )
             # Walkability uses the very same shared cell-by-cell rule as
             # direct construction (strict JSON list format and checkpoint
             # wording preserved); the task pickup/dropoff rules are a separate
@@ -1416,7 +1477,10 @@ class FleetSimulator:
                 record["route"],
                 robot_id=record["robot_id"],
                 checkpoint=True,
+                allowed_closed=allowed_closed,
             )
+            if record["task_id"] is None and dynamic_obstacles:
+                allowed_closed_routes[record["robot_id"]] = dynamic_obstacles
             distance = record["distance_travelled"]
             if not _is_int(distance) or distance < 0:
                 raise ValueError(
@@ -1469,7 +1533,9 @@ class FleetSimulator:
         if replay_change_frames != map_changes:
             raise ValueError("replay map-change frames do not match 'map_changes' history")
 
-        simulator = cls(grid, robots, tasks)
+        simulator = cls(
+            grid, robots, tasks, _allowed_closed_routes=allowed_closed_routes
+        )
         simulator.base_grid = base_grid
         simulator.tick = tick
         simulator.replay = copy.deepcopy(replay)
