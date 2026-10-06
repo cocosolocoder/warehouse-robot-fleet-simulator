@@ -569,6 +569,42 @@ def _validate_route_walk(
     return waypoints
 
 
+def _traffic_blockers(
+    robots: Mapping[str, Robot],
+    paused_robots: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """The robot actually holding each waitable robot's next route cell.
+
+    This is the single occupancy fact behind every traffic-wait judgement --
+    tick settlement, obstacle-edit reconciliation and checkpoint validation
+    all ask it here, so the rule is never re-derived (and never edited) in
+    several places:
+
+    * a robot with no remaining route cannot be held up by traffic;
+    * a robot paused by map unreachability cannot either -- *paused_robots*
+      names the robots whose tasks are paused (checkpoint loading need not
+      pass it: a paused robot's saved route is empty there, so the route
+      check already excludes it);
+    * otherwise the blocker is whichever robot occupies ``route[0]`` in the
+      given layout, never the robot itself (a validated route never starts on
+      the robot's own cell).
+
+    The map itself is deliberately not consulted: a next cell sealed by an
+    obstacle alone produces no blocker -- waiting on a closure is not
+    traffic -- and the callers own every other consequence. One cell holds at
+    most one robot, so each waitable robot maps to at most one blocker.
+    """
+    occupied = {robot.position: robot.robot_id for robot in robots.values()}
+    blockers: dict[str, str] = {}
+    for robot_id, robot in robots.items():
+        if robot_id in paused_robots or not robot.route:
+            continue
+        occupant_id = occupied.get(robot.route[0])
+        if occupant_id is not None and occupant_id != robot_id:
+            blockers[robot_id] = occupant_id
+    return blockers
+
+
 class FleetSimulator:
     def __init__(
         self,
@@ -606,8 +642,11 @@ class FleetSimulator:
         self._map_sequence = 0
         self.paused_tasks: set[str] = set()
         # Consecutive per-robot waits caused purely by other robots:
-        # robot_id -> {"blocked_by": [robot_id, ...], "ticks": int}.
-        self._traffic_waits: dict[str, dict[str, object]] = {}
+        # robot_id -> (blocking robot id, consecutive ticks). The one-blocker
+        # fact and the wait lifecycle live with :func:`_traffic_blockers` and
+        # :meth:`_settle_traffic_waits`; the ``blocked_by`` list shape exists
+        # only at the report/checkpoint boundary.
+        self._traffic_waits: dict[str, tuple[str, int]] = {}
         self._validate_task_ownership(robots, tasks)
         if _routes_prevalidated:
             # Checkpoint recovery has already run the shared
@@ -1456,78 +1495,71 @@ class FleetSimulator:
                 continue
         return False
 
-    def _update_traffic_waits(
-        self,
-        waited: dict[str, str],
-        moved_ids: frozenset[str],
-    ) -> None:
-        """Keep only waits that still hold once the tick's moves have settled.
+    def _settle_traffic_waits(self, waited: Iterable[str]) -> None:
+        """Settle this tick's waits against the end-of-tick layout.
 
-        *waited* maps every robot that stopped this tick purely because
-        another robot held its next waypoint to the robot it saw there at the
-        time; *moved_ids* names the robots that ended up moving. The mid-tick
+        *waited* names every robot that stopped this tick purely because
+        another robot held its next waypoint at the time. That mid-tick
         impression is not trusted on its own, because the blocker may itself
         drive on (or make room for yet another robot) later in the same tick.
-        A record survives only when the robot neither moved nor paused and its
-        next waypoint is occupied by another robot in the final layout; the
-        reported blocker is whichever robot actually occupies that cell. Any
-        other outcome -- the robot moved, its task paused, or the way ahead
-        cleared -- deletes the entry. A wait that continues without a free tick
-        in between keeps accumulating even when the blocker changes identity;
-        once interrupted, a later blockage starts a fresh count at one.
+        The shared :func:`_traffic_blockers` fact on the settled layout then
+        decides everything, so a record survives only when the robot actually
+        waited (is in *waited*), did not move, was not paused and still faces a
+        robot on its next cell; the recorded blocker is whichever robot holds
+        that cell at tick end. Any other outcome -- the robot moved, its task
+        paused, or the way ahead cleared -- removes the entry. A wait that
+        continues without a free tick in between keeps accumulating even when
+        the blocker changes identity; once interrupted, a later blockage
+        starts a fresh count at one.
         """
-        occupied = {robot.position: robot.robot_id for robot in self.robots.values()}
-        surviving: dict[str, dict[str, object]] = {}
+        blockers = _traffic_blockers(self.robots, self._paused_robots())
+        settled: dict[str, tuple[str, int]] = {}
         for robot_id in waited:
-            if robot_id in moved_ids:
+            blocker_id = blockers.get(robot_id)
+            if blocker_id is None:
                 continue
-            robot = self.robots.get(robot_id)
-            if robot is None or not robot.route:
-                continue
-            task = self.tasks.get(robot.task_id) if robot.task_id is not None else None
-            if task is not None and task.task_id in self.paused_tasks:
-                continue
-            blocker_id = occupied.get(robot.route[0])
-            if blocker_id is None or blocker_id == robot_id:
-                continue
-            entry = self._traffic_waits.get(robot_id)
-            if entry is None:
-                surviving[robot_id] = {"blocked_by": [blocker_id], "ticks": 1}
-            else:
-                surviving[robot_id] = {
-                    "blocked_by": [blocker_id],
-                    "ticks": int(entry["ticks"]) + 1,
-                }
-        self._traffic_waits = surviving
+            previous = self._traffic_waits.get(robot_id)
+            ticks = 1 if previous is None else previous[1] + 1
+            settled[robot_id] = (blocker_id, ticks)
+        self._traffic_waits = settled
 
     def _reconcile_traffic_waits_after_map_change(self) -> None:
         """Drop wait records an accepted map edit has invalidated.
 
         A map change never moves a robot, so it can neither create a wait nor
-        add to one; but it can end one. A robot whose task just paused on
-        unreachability has no route left to wait on, and a robot whose
-        replanned next cell is no longer held by the recorded blocker is not
-        blocked by it anymore -- both records are removed. An entry whose
+        add to one; but it can end one, and the same shared fact settles it as
+        a normal tick (:func:`_traffic_blockers`). A robot whose task just
+        paused on unreachability has no route left to wait on, and a robot
+        whose replanned next cell is no longer held by the recorded blocker is
+        not blocked by it anymore -- both records are removed. An entry whose
         robot still faces the very same blocker on its refreshed route keeps
         its count untouched, whatever else the edit changed.
         """
-        occupied = {robot.position: robot.robot_id for robot in self.robots.values()}
-        for robot_id, entry in list(self._traffic_waits.items()):
-            robot = self.robots.get(robot_id)
-            if robot is None or not robot.route:
-                del self._traffic_waits[robot_id]
-                continue
-            if occupied.get(robot.route[0]) not in entry["blocked_by"]:
+        blockers = _traffic_blockers(self.robots, self._paused_robots())
+        for robot_id, (blocker_id, _ticks) in list(self._traffic_waits.items()):
+            if blockers.get(robot_id) != blocker_id:
                 del self._traffic_waits[robot_id]
 
+    def _paused_robots(self) -> frozenset[str]:
+        """Robots whose bound task is paused by map unreachability."""
+        return frozenset(
+            robot.robot_id
+            for robot in self.robots.values()
+            if robot.task_id is not None
+            and robot.task_id in self.paused_tasks
+        )
+
     def _traffic_wait_report(self) -> list[dict[str, object]]:
+        # Fresh containers in robot-id order: a caller that edits a returned
+        # report -- or the one-element ``blocked_by`` list -- can never reach
+        # the simulator's own records or change a later judgement.
         return [
             {
                 "robot_id": robot_id,
-                "blocked_by": list(entry["blocked_by"]),
-                "ticks": entry["ticks"],
+                "blocked_by": [blocker_id],
+                "ticks": ticks,
             }
-            for robot_id, entry in sorted(self._traffic_waits.items())
+            for robot_id, (blocker_id, ticks) in sorted(self._traffic_waits.items())
         ]
 
     # ------------------------------------------------------------------
@@ -1586,7 +1618,11 @@ class FleetSimulator:
         reserved: dict[tuple[int, int], str] = {}
         moved: list[str] = []
         moved_ids: set[str] = set()
-        blocked_by: dict[str, str] = {}
+        # Robots that stopped this tick on another robot. Only the set of
+        # identities is kept: which robot each one saw mid-tick is not
+        # trusted -- the end-of-tick layout settles the actual blocker (see
+        # :meth:`_settle_traffic_waits`).
+        waited: set[str] = set()
 
         def relocate(robot: Robot, destination: tuple[int, int]) -> None:
             del occupied[robot.position]
@@ -1654,7 +1690,7 @@ class FleetSimulator:
                     ):
                         # The blocker is expected to drive on within this
                         # tick, so waiting one tick is cheaper than detouring.
-                        blocked_by[robot.robot_id] = blocker_id
+                        waited.add(robot.robot_id)
                         continue
             # The blocker cannot or will not move this tick: try to sidestep
             # onto a free adjacent cell and replan from there.
@@ -1667,8 +1703,8 @@ class FleetSimulator:
                 robot.route = route
                 self._finish_if_arrived(robot)
                 continue
-            blocked_by[robot.robot_id] = blocker_id
-        self._update_traffic_waits(blocked_by, frozenset(moved_ids))
+            waited.add(robot.robot_id)
+        self._settle_traffic_waits(waited)
         self.tick += 1
         event: dict[str, object] = {
             "type": "tick",
@@ -2275,14 +2311,21 @@ class FleetSimulator:
     @classmethod
     def _load_traffic_waits(
         cls, data: Mapping[str, object], robot_by_id: Mapping[str, Robot]
-    ) -> dict[str, dict[str, object]]:
+    ) -> dict[str, tuple[str, int]]:
         # Optional in every format version; older files simply lack the field
-        # and their robots start with zero recorded waits.
+        # and their robots start with zero recorded waits. Only the saved tick
+        # count is restored: nothing here is invented from the layout to fill
+        # a missing record, and nothing here is silently repaired -- the strict
+        # rejections below are all preserved.
         raw = data.get("traffic_waits", [])
         if not isinstance(raw, list):
             raise ValueError("checkpoint field 'traffic_waits' must be a list")
-        occupied = {robot.position: robot.robot_id for robot in robot_by_id.values()}
-        waits: dict[str, dict[str, object]] = {}
+        # The very same occupancy fact tick settlement and obstacle-edit
+        # reconciliation judge with: the robot actually holding each waiting
+        # robot's next route cell in the saved layout. A paused robot carries
+        # an empty saved route, so it is absent here just as at runtime.
+        blockers = _traffic_blockers(robot_by_id)
+        waits: dict[str, tuple[str, int]] = {}
         for index, entry in enumerate(raw):
             context = f"traffic wait entry {index}"
             if not isinstance(entry, dict):
@@ -2319,14 +2362,14 @@ class FleetSimulator:
                 raise ValueError(
                     f"{context} robot {robot_id!r} has no remaining route to wait on"
                 )
-            # The record must reflect the saved layout: the robot's next route
-            # cell is held by exactly the robots named in 'blocked_by'. One
-            # cell holds at most one robot, so the list must name precisely
-            # the occupant of that cell -- a blocker parked elsewhere, an
-            # empty next cell, or extra names alongside the real blocker all
-            # make the whole checkpoint inconsistent.
+            # The record must agree exactly with the saved layout: the robot's
+            # next route cell is held by precisely the one robot named in
+            # 'blocked_by'. One cell holds at most one robot, so an empty next
+            # cell, a blocker parked elsewhere, or extra names alongside the
+            # real blocker all make the whole checkpoint inconsistent rather
+            # than being trimmed or corrected here.
             next_cell = robot_by_id[robot_id].route[0]
-            occupant_id = occupied.get(next_cell)
+            occupant_id = blockers.get(robot_id)
             if occupant_id is None:
                 raise ValueError(
                     f"{context} robot {robot_id!r} is recorded as blocked by "
@@ -2339,7 +2382,7 @@ class FleetSimulator:
                     f"{list(next_cell)} occupied by robot {occupant_id!r}, which "
                     f"does not match the recorded blockers {sorted(blocked_by)}"
                 )
-            waits[robot_id] = {"blocked_by": list(blocked_by), "ticks": ticks}
+            waits[robot_id] = (occupant_id, ticks)
         return waits
 
     @staticmethod
