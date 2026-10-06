@@ -53,6 +53,15 @@ block other tasks. The next `step()` after cells reopen automatically resumes
 paused driving and assigns waiting tasks; collision avoidance still applies and
 robots never enter a new obstacle.
 
+A robot without a bound task that is still driving a preset route is treated
+differently: closing a cell on its remaining route neither clears nor replans
+that route. The robot keeps every unconsumed waypoint, drives the cells still
+open before the closure, and then simply waits in front of the closed cell —
+waiting consumes no waypoint and adds no mileage. When the cell reopens it
+continues the same route in the same order; it never picks a shortcut and
+never skips the blocked waypoint. Such a waiting state saves and restores
+through checkpoints (see below).
+
 Queries and history:
 
 ```python
@@ -196,9 +205,10 @@ Checkpoints are UTF-8 encoded JSON. The top-level object contains:
 Loading validates the entire document: corrupted JSON, missing or wrongly
 typed fields, unsupported versions, duplicate robot or task ids, overlapping
 or out-of-bounds/blocked robot positions, routes that leave the map, cross
-obstacles, make non-adjacent moves, or cannot complete the robot's bound task,
-task/robot ownership mismatches, a broken replay history, out-of-bounds or
-add/remove-conflicting change records,
+obstacles unexplained by the change history, make non-adjacent moves, or
+cannot complete the robot's bound task, task/robot ownership mismatches, a
+broken replay history, out-of-bounds or add/remove-conflicting change
+records,
 a change history that does not reproduce the saved grid, and an inconsistent
 paused-task state are all rejected. So is a replay whose *history* could never
 have happened, even when its final frame matches the saved robots: a robot out
@@ -225,5 +235,22 @@ the dropoff, or when position, pickup and dropoff all coincide; map-paused
 tasks keep their empty-route exemption. Version 1 documents contain
 tick frames without a `type` field and none of the edit-related keys; they
 load as if no map edit had ever happened.
+
+The one blocked-waypoint route a version 2 checkpoint accepts belongs to a
+robot with no bound task that is waiting out a dynamic closure: the blocked
+waypoint must have been traversable on the initial map, a valid map change
+must have closed it, and it must still be closed in the saved grid — exactly
+the state normal running produces when a preset route reaches a cell that was
+later shut. Saving and loading preserve the position, the remaining waypoint
+order, the mileage and the change history without advancing time or moving
+the robot; on resume the robot finishes the still-open waypoints, waits
+without consuming a waypoint or gaining mileage, and continues the original
+route from the next cell once the way reopens, never detouring or skipping.
+The exemption is narrow: creating a fleet directly still rejects a route
+through an initial obstacle, a blocked waypoint that the change history
+cannot explain is rejected, task-bound robots keep their reroute/pause rules,
+and version 1 files keep the old requirement. A robot standing on an
+obstacle, an out-of-map or non-integer waypoint, and a jump between waypoints
+are rejected regardless.
 
 
