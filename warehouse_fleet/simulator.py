@@ -1386,7 +1386,13 @@ class FleetSimulator:
             "robots": {robot_id: list(robot.position) for robot_id, robot in sorted(self.robots.items())},
             "completed": sorted(task.task_id for task in self.tasks.values() if task.completed),
         }
-        self.replay.append(event)
+        # The replay keeps an independent deep copy while the caller receives
+        # the freshly built frame itself. The two object graphs never share a
+        # list, dict or coordinate pair, so deleting entries from the returned
+        # frame, editing its robot coordinates or rewriting the moved/completed
+        # lists can never change the recorded history -- later snapshots,
+        # continued runs and saved checkpoints all see the real history.
+        self.replay.append(copy.deepcopy(event))
         return event
 
     def _finish_if_arrived(self, robot: Robot) -> None:
@@ -1430,12 +1436,24 @@ class FleetSimulator:
         return copy.deepcopy(self.map_changes)
 
     def snapshot(self) -> dict[str, object]:
+        """Capture the result of the current moment as an independent copy.
+
+        The query advances nothing: no tick, robot move or replay event. Every
+        part of the result is freshly built -- ``asdict`` gives each robot and
+        task its own dict with copied coordinates and routes, metrics reports
+        fresh lists, and the replay is deep-copied -- so deleting replay
+        entries, rewriting frame coordinates, or editing the moved/completed
+        lists of the returned snapshot touches only that snapshot. The real
+        clock, robot and task states, mileage, recorded replay and map-change
+        history are untouched, two snapshots of the same moment share nothing,
+        and frames produced after the snapshot never grow into it.
+        """
         return {
             "tick": self.tick,
             "robots": [asdict(robot) for robot in sorted(self.robots.values(), key=lambda item: item.robot_id)],
             "tasks": [asdict(task) for task in sorted(self.tasks.values(), key=lambda item: item.task_id)],
             "metrics": self.metrics(),
-            "replay": self.replay,
+            "replay": copy.deepcopy(self.replay),
         }
 
     # ------------------------------------------------------------------
