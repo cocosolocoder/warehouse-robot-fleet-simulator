@@ -118,6 +118,27 @@ FleetSimulator(grid, [carrier, stray], [in_flight, history])
 # ValueError: robot 'R-2' executes task 'T-0' that is already completed
 ```
 
+### Task coordinates
+
+Every task's `pickup` and `dropoff` must be a list or tuple holding exactly
+two plain integers, and the two spellings may be mixed freely within one task
+or batch. Booleans are not integers, and a float is rejected even when it
+equals an integer value (`1.0` is not `1`); strings, `None`, scalars, missing
+or extra components, and any other non-coordinate input raise `ValueError`
+naming the task and whether its pickup or dropoff is at fault. Nothing is
+rounded, padded, or type-converted. Accepted points are normalized to fresh
+integer tuples — `[1, 0]` and `(1, 0)` name the same cell, so container type
+can never make a robot miss a pickup or fail a delivery — and the copy means
+mutating a coordinate list you passed in after construction never changes the
+fleet. The rule applies to tasks in every state (waiting, assigned, loaded,
+completed) and, like positions, commits only once the whole batch passes, so a
+later bad point, ownership conflict, or route error leaves every earlier
+`Robot` and `Task` object — containers, routes, bindings, mileage and flags —
+exactly as passed in. Coordinate validity is separate from reachability: a
+well-formed task no robot can currently reach simply keeps waiting, and a
+loaded task whose pickup cell has since been closed keeps the goods and its
+owner.
+
 ### Remaining routes for in-flight tasks
 
 A robot's remaining route omits its current cell: the first waypoint must be

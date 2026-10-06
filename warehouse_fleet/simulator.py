@@ -82,6 +82,36 @@ are left untouched. The very same ownership and completed-history rules
 govern checkpoint loading, so a completion record one entry point accepts
 can never be a record the other cannot reload.
 
+Every task's pickup point and dropoff is validated with the very same strict
+coordinate rule as robot positions (:func:`_as_cell`): each must be a list or
+tuple holding exactly two plain integers, and the two spellings may be mixed
+freely within one task and across one batch. A boolean is never an integer
+here -- not even ``True`` for a 1-coordinate -- and a float is refused even
+when it equals an integer value such as ``1.0``; strings, nulls, scalars,
+missing components, extra components and anything that is not a coordinate
+pair all raise :class:`ValueError` naming the task id and whether its pickup
+or its dropoff is at fault -- nothing is rounded, padded or coerced into a
+pair, so a fleet can never accept a task that its own checkpoint loading
+would later reject. An accepted point is normalized to a fresh integer tuple
+(``[1, 0]`` and ``(1, 0)`` therefore name one cell: a robot can neither miss
+a pickup nor fail a delivery merely because the containers differ), and the
+copy means a caller that keeps mutating its original coordinate lists after
+construction can never change the created fleet. The rule covers every task
+regardless of state -- waiting for assignment, already assigned and heading
+to pickup, carrying the goods, and finished historical records alike. Like
+position normalization, the points commit nothing until the whole batch
+(positions, ownership, routes and all task points) has passed: a failure on a
+later task point, robot route or binding leaves every earlier task holding
+its original pickup/dropoff containers and every flag, binding, route and
+mileage exactly as passed in. Coordinate validity and current reachability
+are deliberately separate judgements: a well-formed task no robot can
+currently reach simply keeps waiting, and a loaded task whose pickup cell has
+since been closed keeps the goods and its owner -- neither is a coordinate
+error, and selection order, planning, obstacle handling and completion
+history behave exactly as before. Checkpoints keep their integer coordinate
+arrays and strict loading rules unchanged -- no format bump and no
+relaxation.
+
 Every robot's starting position is validated with the very same strict
 coordinate rule its route waypoints use (:func:`_as_cell`): it must be a list
 or tuple holding exactly two plain integers, and the two spellings may be
@@ -535,10 +565,12 @@ class FleetSimulator:
         # list or tuple of two plain integers is accepted (booleans, floats and
         # strings never act as coordinates), and every accepted position is
         # normalized to a fresh integer tuple before any state is committed.
-        # This mirrors :meth:`_normalize_initial_routes`: all robots and tasks
-        # stay exactly as the caller passed them until the whole batch --
-        # positions, overlaps, ownership and routes -- has passed.
+        # Task pickup/dropoff points follow the very same rule. This mirrors
+        # :meth:`_normalize_initial_routes`: all robots and tasks stay exactly
+        # as the caller passed them until the whole batch -- positions, task
+        # points, overlaps, ownership and routes -- has passed.
         normalized_positions = self._normalize_start_positions(grid, robots)
+        normalized_task_points = self._normalize_task_coordinates(tasks)
         self.robots = {robot.robot_id: robot for robot in robots}
         self.tasks = {task.task_id: task for task in tasks}
         self.tick = 0
@@ -561,21 +593,27 @@ class FleetSimulator:
             # so nothing needs committing here. Every other constructor check
             # above still ran.
             return
-        # Accepted positions and routes share one internal shape regardless of
-        # how the caller spelled them: an integer tuple for the position and a
-        # mutable list of tuple cells for the route. The normalized copies are
-        # committed together only after every robot passed validation, so a
-        # rejection -- even one buried in a later robot's route -- never touches
-        # the caller's objects: a fleet whose routes fail is rejected with every
-        # robot still holding the original position object and route. See
-        # :meth:`_normalize_initial_routes` and
-        # :meth:`_normalize_start_positions`.
+        # Accepted positions, routes and task points share one internal shape
+        # regardless of how the caller spelled them: an integer tuple for the
+        # position and each pickup/dropoff, and a mutable list of tuple cells
+        # for the route. The normalized copies are committed together only
+        # after every robot and task passed validation, so a rejection -- even
+        # one buried in a later robot's route or task point -- never touches
+        # the caller's objects: a fleet whose routes fail is rejected with
+        # every robot still holding the original position object and route and
+        # every task still holding its original pickup/dropoff containers. See
+        # :meth:`_normalize_initial_routes`,
+        # :meth:`_normalize_start_positions` and
+        # :meth:`_normalize_task_coordinates`.
         normalized_routes = self._normalize_initial_routes(
             grid, robots, normalized_positions
         )
         for robot, position, route in zip(robots, normalized_positions, normalized_routes):
             robot.position = position
             robot.route = route
+        for task, (pickup, dropoff) in zip(tasks, normalized_task_points):
+            task.pickup = pickup
+            task.dropoff = dropoff
 
     @staticmethod
     def _normalize_start_positions(
@@ -626,6 +664,47 @@ class FleetSimulator:
                 )
             occupied[position] = robot.robot_id
             normalized.append(position)
+        return normalized
+
+    @staticmethod
+    def _normalize_task_coordinates(
+        tasks: Sequence[Task],
+    ) -> list[tuple[Position, Position]]:
+        """Validate every task's pickup and dropoff and return tuple copies.
+
+        Task points share the strict position rule (:func:`_as_cell`): each one
+        must be a list or tuple (the two spellings may be mixed within one
+        task and across one batch) holding exactly two plain integers --
+        booleans are rejected even though they are Python ints, and floats
+        (even ``1.0``), strings, nulls, missing components, extra components
+        and non-pair inputs are all refused with :class:`ValueError` naming the
+        task and whether its pickup or its dropoff is at fault, never rounded,
+        padded or coerced. This runs for every task regardless of state --
+        waiting for assignment, en route to pickup, already carrying the goods
+        or already completed -- so a malformed point in a finished historical
+        record is refused at construction just like one in a pending task.
+
+        Coordinate validity is deliberately kept separate from reachability:
+        whether a robot can currently reach the points is never judged here, so
+        a well-formed task whose pickup is currently unreachable keeps waiting
+        exactly as before, and a loaded task whose pickup cell has since been
+        closed keeps the goods and its binding -- neither is an error.
+
+        The check is read-only: it returns a fresh integer tuple per point and
+        commits nothing itself. The caller assigns the tuples to the tasks only
+        once the whole batch (positions, ownership and routes included) has
+        passed, so a later rejection leaves the caller's tasks holding their
+        original pickup/dropoff containers, and the tuple copy means mutating
+        an originally passed-in list after construction can never change the
+        created fleet. A list and a tuple naming one cell normalize to equal
+        tuples, so they can never make a robot miss a pickup or fail a delivery
+        merely because of the container type.
+        """
+        normalized: list[tuple[Position, Position]] = []
+        for task in tasks:
+            pickup = _as_cell(task.pickup, f"task {task.task_id!r} pickup")
+            dropoff = _as_cell(task.dropoff, f"task {task.task_id!r} dropoff")
+            normalized.append((pickup, dropoff))
         return normalized
 
     @staticmethod
