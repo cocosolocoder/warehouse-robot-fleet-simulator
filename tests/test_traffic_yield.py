@@ -1215,5 +1215,125 @@ class YieldDeterminismTests(unittest.TestCase):
         self.assertEqual(first.snapshot(), second.snapshot())
 
 
+class EmptyIdentifierDeadEndTests(unittest.TestCase):
+    """A parked robot whose id is the empty string still occupies its cell.
+
+    ``""`` is a legal robot id, not the absence of a robot: an occupancy map
+    must not read it as a free cell. The scenario below is a one-wide corridor
+    sealed at the end by the parked ``""`` robot with only one lower side cell
+    ``(2, 1)`` available; neither robot can sidestep anywhere that resolves the
+    jam, so every move would be an undone retreat and the whole fleet waits.
+    """
+
+    WIDTH = 4
+    OBSTACLES = frozenset({(0, 1), (1, 1), (3, 1)})
+
+    def build(self) -> FleetSimulator:
+        grid = GridMap(self.WIDTH, 2, self.OBSTACLES)
+        robots = [
+            Robot("A", (1, 0), route=[(2, 0), (3, 0)], task_id="T-A"),
+            Robot("B", (2, 0), route=[(3, 0)], task_id="T-B"),
+            Robot("", (3, 0)),
+        ]
+        tasks = [
+            Task("T-A", (1, 0), (3, 0), assigned_robot="A", picked_up=True),
+            Task("T-B", (2, 0), (3, 0), assigned_robot="B", picked_up=True),
+        ]
+        return FleetSimulator(grid, robots, tasks)
+
+    def test_no_robot_moves_and_nothing_completes(self) -> None:
+        sim = self.build()
+        for _ in range(5):
+            event = sim.step()
+            self.assertEqual(event["moved"], [])
+            self.assertEqual(event["completed"], [])
+        self.assertEqual(sim.robots["A"].position, (1, 0))
+        self.assertEqual(sim.robots["A"].route, [(2, 0), (3, 0)])
+        self.assertEqual(sim.robots["B"].position, (2, 0))
+        self.assertEqual(sim.robots["B"].route, [(3, 0)])
+        self.assertEqual(sim.robots[""].position, (3, 0))
+        self.assertEqual(sim.robots[""].route, [])
+        for robot in sim.robots.values():
+            self.assertEqual(robot.distance_travelled, 0)
+        self.assertFalse(any(task.completed for task in sim.tasks.values()))
+        for task_id, owner in (("T-A", "A"), ("T-B", "B")):
+            task = sim.tasks[task_id]
+            self.assertTrue(task.picked_up)
+            self.assertEqual(task.assigned_robot, owner)
+
+    def test_replay_frames_record_positions_with_empty_moves(self) -> None:
+        sim = self.build()
+        for _ in range(3):
+            sim.step()
+        frames = [frame for frame in sim.replay if frame.get("type") == "tick"]
+        self.assertEqual([frame["tick"] for frame in frames], [1, 2, 3])
+        for frame in frames:
+            self.assertEqual(frame["moved"], [])
+            self.assertEqual(
+                frame["robots"],
+                {"": [3, 0], "A": [1, 0], "B": [2, 0]},
+            )
+
+    def test_waits_accumulate_with_the_empty_id_named_as_blocker(self) -> None:
+        sim = self.build()
+        for tick in range(1, 5):
+            sim.step()
+            waits = {entry["robot_id"]: entry for entry in sim.status()["traffic_waits"]}
+            self.assertEqual(waits["A"]["blocked_by"], ["B"])
+            self.assertEqual(waits["A"]["ticks"], tick)
+            self.assertEqual(waits["B"]["blocked_by"], [""])
+            self.assertEqual(waits["B"]["ticks"], tick)
+            # The parked end robot is itself never recorded as waiting.
+            self.assertNotIn("", waits)
+            # Traffic waits must never be reported as map-unreachability pauses.
+            self.assertEqual(sim.status()["paused_tasks"], [])
+
+    def test_checkpoint_keeps_the_empty_id_and_its_wait_reference(self) -> None:
+        sim = self.build()
+        for _ in range(3):
+            sim.step()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "fleet.json")
+            sim.save_checkpoint(path)
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+            self.assertIn(
+                {"robot_id": "", "position": [3, 0], "route": [],
+                 "task_id": None, "distance_travelled": 0},
+                document["robots"],
+            )
+            self.assertIn(
+                {"robot_id": "B", "blocked_by": [""], "ticks": 3},
+                document["traffic_waits"],
+            )
+            restored = FleetSimulator.load_checkpoint(path)
+            waits = {entry["robot_id"]: entry for entry in restored.status()["traffic_waits"]}
+            self.assertEqual(waits["B"]["blocked_by"], [""])
+            self.assertEqual(waits["B"]["ticks"], 3)
+            self.assertEqual(restored.robots[""].position, (3, 0))
+            event = restored.step()
+            self.assertEqual(event["moved"], [])
+            waits = {entry["robot_id"]: entry for entry in restored.status()["traffic_waits"]}
+            self.assertEqual(waits["A"]["ticks"], 4)
+            self.assertEqual(waits["B"]["ticks"], 4)
+
+    def test_empty_id_robot_still_yields_when_a_side_cell_is_safe(self) -> None:
+        grid = GridMap(3, 2)
+        robot = Robot("R", (1, 0), route=[(2, 0)], task_id="T")
+        parked = Robot("", (2, 0))
+        task = Task("T", (1, 0), (2, 0), assigned_robot="R", picked_up=True)
+        sim = FleetSimulator(grid, [robot, parked], [task])
+        event = sim.step()
+        self.assertEqual(set(event["moved"]), {"", "R"})
+        self.assertEqual(sim.robots[""].position, (2, 1))
+        self.assertEqual(sim.robots["R"].position, (2, 0))
+        self.assertEqual(sim.robots[""].distance_travelled, 1)
+        self.assertEqual(sim.robots["R"].distance_travelled, 1)
+        self.assertTrue(task.completed)
+        self.assertIsNone(robot.task_id)
+        # The yielding robot stays parked on its side cell and keeps no task.
+        self.assertIsNone(sim.robots[""].task_id)
+
+
 if __name__ == "__main__":
     unittest.main()

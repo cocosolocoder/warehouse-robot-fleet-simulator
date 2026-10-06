@@ -1404,7 +1404,13 @@ class FleetSimulator:
                     and ahead not in reserved
                 ):
                     return True
-                occupant_id = cur_occupied.get(ahead) or reserved.get(ahead)
+                # An empty-string robot id is a real occupant, not an empty
+                # cell: only None means "nobody here", so the lookup must never
+                # collapse to a truthiness check (which would let "" be read as
+                # a free cell and send robots yielding against a phantom exit).
+                occupant_id = cur_occupied.get(ahead)
+                if occupant_id is None:
+                    occupant_id = reserved.get(ahead)
                 if (
                     occupant_id is not None
                     and occupant_id != current.robot_id
@@ -1469,7 +1475,11 @@ class FleetSimulator:
                 hyp_occupied[side_cell] = current.robot_id
                 holder_id: str | None = None
                 for cell in route[1:]:
-                    holder = hyp_occupied.get(cell) or reserved.get(cell)
+                    # As above, "" names a real robot: distinguish the absent
+                    # cell (None) from the one held by the empty-string id.
+                    holder = hyp_occupied.get(cell)
+                    if holder is None:
+                        holder = reserved.get(cell)
                     if holder is not None and holder != current.robot_id:
                         holder_id = holder
                         break
