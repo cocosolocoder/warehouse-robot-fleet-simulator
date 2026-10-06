@@ -30,7 +30,11 @@ only leads back to the same immovable blocker is never taken though: if the
 replanned route immediately returns through the vacated cell, still passes the
 blocker's cell and the blocker cannot use the opening to leave (a dead end or
 corridor end with traffic parked beyond it), the robot simply waits -- extra
-empty cells stretching out behind it change nothing. Yield moves count as
+empty cells stretching out behind it change nothing. The blocker's ability to
+leave is judged by the same standard all the way down: a blocker whose only
+way aside is itself a side step that returns to the corridor and the same
+immovable blockage has no real way out, so the robot behind it keeps waiting
+instead of shuttling. Yield moves count as
 mileage, waiting does not. The task keeps its original robot, pickup and
 completion rules are unchanged, and a robot paused by map unreachability never
 takes part in yielding. If no safe side cell exists the robots simply wait:
@@ -929,6 +933,15 @@ class FleetSimulator:
         the blocker cannot leave its own cell through the gap that opens up.
         A route that bypasses the blocker entirely is a genuine detour and is
         never rejected here.
+
+        The same test backs both callers: :meth:`_self_sidestep` applies it to
+        the blocked robot's own retreat, and :meth:`_can_vacate` applies it to
+        a task-bound blocker's candidate side step, so a blocker whose only
+        escape itself leads back to the same immovable blockage is not counted
+        as able to leave. *already_moved* carries the robots that cannot make
+        another move this tick -- the robots that already used their move plus,
+        from :meth:`_can_vacate`, the whole dependency chain gathered so far --
+        so a cyclic dependency still closes instead of proving an exit.
         """
         if not replanned or replanned[0] != robot.position:
             return False
@@ -970,7 +983,10 @@ class FleetSimulator:
         blocker -- task-bound, or taskless but still driving a remaining route
         -- leaves by driving onto its next waypoint (possibly following a
         chain of robots that all move this tick); a task-bound one may also
-        sidestep onto a free adjacent cell itself. Robots paused by map
+        sidestep onto a free adjacent cell itself, provided that side step is
+        not itself a futile bounce back onto its own cell in front of the same
+        unmoving robot (judged by the shared :meth:`_is_bounceback_retreat`
+        test). Robots paused by map
         unreachability never move. *checking* names robots already on the
         dependency chain (including robots that used their one move of this
         tick), so meeting one again closes a cyclic dependency -- a head-on
@@ -1051,12 +1067,35 @@ class FleetSimulator:
                 continue
             # Otherwise the task-bound blocker might sidestep onto a free side
             # cell itself, but not onto a cell the retreating requester still has
-            # to use -- parking there only moves the blockage.
+            # to use -- parking there only moves the blockage. The side step is
+            # judged by the same standard as the requester's own retreat: one
+            # that only sends this robot back onto its old cell to face the very
+            # same robot ahead (which itself has no way out) is undone next
+            # tick, so it does not count as leaving either.
+            ahead_blocker_id = occupied.get(current.route[0])
+            if ahead_blocker_id is None:
+                ahead_blocker_id = reserved.get(current.route[0])
             for side_cell in self._safe_side_cells(
                 current, occupied, reserved, forbidden=blocked_path
             ):
-                if self._plan_route(current, task, start=side_cell) is not None:
-                    return True
+                route = self._plan_route(current, task, start=side_cell)
+                if route is None:
+                    continue
+                if (
+                    ahead_blocker_id is not None
+                    and ahead_blocker_id != current.robot_id
+                    and self._is_bounceback_retreat(
+                        current,
+                        side_cell,
+                        route,
+                        ahead_blocker_id,
+                        occupied,
+                        reserved,
+                        current_checking,
+                    )
+                ):
+                    continue
+                return True
         return False
 
     def _update_traffic_waits(
