@@ -149,6 +149,14 @@ Version 1 documents store tick frames without a ``type`` field and have no
 ``map_changes`` or ``base_grid`` key; they load with their grid taken as the
 baseline, as if no map edit ever happened.
 
+The ordinary-tick-frame rules both versions share -- the replay container is
+a list, every frame is an object, and tick frames are numbered consecutively
+from 1 with a well-formed payload -- are owned by the single shared
+:meth:`FleetSimulator._iter_replay_events` scan, so they are maintained in
+exactly one place. Each version keeps its own handling on top: version 1
+rejects non-tick frames and fills in the missing ``type`` on a copy, while
+version 2 dispatches event types and enforces its map-change ordering.
+
 Both map definitions are validated by the single shared
 :meth:`FleetSimulator._load_map_definition` rule -- positive integer
 dimensions, an obstacle list of integer ``[x, y]`` pairs inside the map --
@@ -1936,14 +1944,28 @@ class FleetSimulator:
                 )
 
     @classmethod
-    def _load_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
+    def _iter_replay_events(
+        cls, data: Mapping[str, object]
+    ) -> Iterator[tuple[int, dict[str, object], object]]:
+        """Yield ``(index, frame, frame_type)`` for every replay event in order.
+
+        This is the single place that owns the ordinary-tick-frame rules both
+        format versions share, so they are never maintained twice: the
+        ``replay`` field must be a list, every frame must be an object, a
+        missing ``type`` means an ordinary tick frame, and tick frames must be
+        numbered consecutively from 1 -- map-change events sit between ticks
+        without consuming a number -- with a well-formed payload (checked via
+        the equally shared :meth:`_validate_tick_frame_payload`). Anything
+        beyond that stays with the two loaders: version 1 rejects non-tick
+        frames and normalizes the ``type`` field, version 2 keeps its own
+        event-type dispatch and map-change ordering checks. The scan is lazy,
+        so each frame is examined exactly when the consuming loader reaches it
+        and the first problem is reported in the same order as before.
+        """
         raw = cls._require_field(data, "replay")
         if not isinstance(raw, list):
             raise ValueError("checkpoint field 'replay' must be a list")
-        replay: list[dict[str, object]] = []
         tick_index = 0
-        last_map_tick = -1
-        last_map_sequence = 0
         for index, frame in enumerate(raw):
             if not isinstance(frame, dict):
                 raise ValueError(f"replay frame {index} must be an object")
@@ -1959,6 +1981,17 @@ class FleetSimulator:
                         f"{index} has tick {frame_tick}, expected {tick_index}"
                     )
                 cls._validate_tick_frame_payload(frame, frame_tick)
+            yield index, frame, frame_type
+
+    @classmethod
+    def _load_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
+        replay: list[dict[str, object]] = []
+        tick_index = 0
+        last_map_tick = -1
+        last_map_sequence = 0
+        for index, frame, frame_type in cls._iter_replay_events(data):
+            if frame_type == "tick":
+                tick_index += 1
                 replay.append(frame)
             elif frame_type == "map_change":
                 tick = frame.get("tick")
@@ -2020,25 +2053,15 @@ class FleetSimulator:
 
     @classmethod
     def _load_legacy_replay(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
-        raw = cls._require_field(data, "replay")
-        if not isinstance(raw, list):
-            raise ValueError("checkpoint field 'replay' must be a list")
+        # The container, frame-object and consecutive-tick rules are the shared
+        # ones in :meth:`_iter_replay_events`; version 1 only adds its own
+        # event-type policy on top: map changes do not exist yet, and ordinary
+        # frames may lack the ``type`` field, which is filled in on a copy so
+        # the loaded document is never rewritten.
         replay: list[dict[str, object]] = []
-        for index, frame in enumerate(raw):
-            if not isinstance(frame, dict):
-                raise ValueError(f"replay frame {index} must be an object")
-            frame_type = frame.get("type", "tick")
+        for index, frame, frame_type in cls._iter_replay_events(data):
             if frame_type != "tick":
                 raise ValueError("version 1 checkpoints cannot contain map change frames")
-            frame_tick = frame.get("tick")
-            if not _is_int(frame_tick):
-                raise ValueError(f"replay frame {index} field 'tick' must be an integer")
-            if frame_tick != index + 1:
-                raise ValueError(
-                    "replay tick numbers must run consecutively from 1; frame "
-                    f"{index} has tick {frame_tick}, expected {index + 1}"
-                )
-            cls._validate_tick_frame_payload(frame, frame_tick)
             normalized = dict(frame)
             normalized["type"] = "tick"
             replay.append(normalized)
