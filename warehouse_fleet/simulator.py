@@ -66,14 +66,22 @@ still unfinished and is assigned back to that robot; every unfinished task
 that names an owner must name an existing robot whose current task it is, and
 a task with the goods collected may never lack that owner. One robot is
 therefore never claimed by two unfinished tasks, and a robot may never be
-bound to a completed task. Finished tasks only retain *historical* ownership:
-their recorded robot need not be idle or name them back, may already work a
-new task, and may even be absent from the fleet. Unassigned, not-yet-collected
-tasks simply wait -- including ones no robot can currently reach -- and are
-not an ownership error. Conflicts raise :class:`ValueError` naming the robot
-or task involved; nothing is rebound, unassigned or dropped, and the caller's
-objects are left untouched. The same unfinished-task binding rules govern
-checkpoint loading (which additionally keeps its historical-state checks).
+bound to a completed task. A completed task is kept only as a complete
+*historical* record: it must have the goods marked as collected *and* must
+name the robot that finished it -- a historical owner of ``None`` means there
+is no record and is rejected, not treated as a task still waiting to be
+assigned. Both facts are required even when the pickup point and dropoff are
+the same cell. Their recorded robot need not be idle or name the task back,
+may already work a new task, may have finished several historical tasks, and
+may even be absent from the fleet: the historical task keeps its state, never
+re-enters assignment and still counts towards the completed total. Unassigned,
+not-yet-collected tasks simply wait -- including ones no robot can currently
+reach -- and are not an ownership error. Conflicts raise
+:class:`ValueError` naming the robot or task involved; nothing is rebound,
+unassigned or dropped, and the caller's objects are left untouched. The same
+ownership and completion-record rules govern direct construction and
+checkpoint loading from the single shared check (checkpoint loading
+additionally keeps its other historical-state checks).
 
 Every robot's remaining route is also validated as a walk on the given map,
 whether or not the robot is bound to a task, and direct construction and
@@ -550,14 +558,28 @@ class FleetSimulator:
         * A robot can therefore never be claimed by two unfinished tasks: the
           second task's owner points at a robot that executes another task.
 
-        Completed tasks only keep *historical* ownership: their recorded
-        ``assigned_robot`` is not required to be idle or to name them back, so
-        a robot that already finished one task may be idle or busy with a new
-        one. Unassigned, not-yet-collected tasks simply wait -- even when no
-        robot can reach them -- and are not an ownership error. Nothing here
-        rewrites a binding or drops a task; an inconsistent input is rejected
-        as a whole with a :class:`ValueError` naming the conflicting robot or
-        task, leaving the caller's objects untouched.
+        A completed task is accepted only as a complete *historical* record:
+        it must have the goods marked as collected and must name the robot that
+        finished it -- a historical ``assigned_robot`` of ``None`` means no
+        record exists at all, which is rejected rather than read as a task
+        still waiting for assignment. Either missing fact raises a
+        :class:`ValueError` naming the task and the contradiction, even when
+        the task's pickup point and dropoff are the same cell: coincident
+        points never turn an incomplete record into a legal completion. The
+        historical ownership is deliberately distinct from a current binding:
+        the recorded robot need not be idle or name the task back, may already
+        work a new unfinished task, may have finished several such historical
+        tasks, and may even be absent from the fleet. Such a task keeps its
+        completed state and historical owner, never re-enters assignment and
+        still counts towards the completed total.
+
+        Unassigned, not-yet-collected tasks simply wait -- even when no robot
+        can reach them -- and are not an ownership error. Nothing here
+        rewrites a binding, fills in a missing owner or pickup flag, or drops
+        a task; an inconsistent input is rejected as a whole with a
+        :class:`ValueError` naming the conflicting robot or task, leaving the
+        caller's objects untouched. Direct construction and checkpoint
+        loading run this very same check.
         """
         robot_by_id = {robot.robot_id: robot for robot in robots}
         task_by_id = {task.task_id: task for task in tasks}
@@ -602,6 +624,26 @@ class FleetSimulator:
                         f"task {task.task_id!r} claims robot {owner.robot_id!r} "
                         f"but the robot executes {owner.task_id!r}"
                     )
+        for task in tasks:
+            # A finished task is history rather than work in progress, but the
+            # record must be self-consistent: completion can only follow
+            # collection, and "no historical robot" (assigned_robot is None)
+            # is a missing record, not a task waiting to be assigned. Both
+            # facts are required independently of the task geometry, so a task
+            # whose pickup and dropoff coincide gets no presumption either.
+            if not task.completed:
+                continue
+            if not task.picked_up:
+                raise ValueError(
+                    f"task {task.task_id!r} is completed but never picked up: "
+                    "a completed task must record the goods as collected"
+                )
+            if task.assigned_robot is None:
+                raise ValueError(
+                    f"task {task.task_id!r} is completed but has no historical "
+                    "assigned robot: a completed task must name the robot that "
+                    "finished it"
+                )
 
     @staticmethod
     def _normalize_initial_routes(
@@ -1643,23 +1685,12 @@ class FleetSimulator:
         robot_by_id = {robot.robot_id: robot for robot in robots}
         task_by_id = {task.task_id: task for task in tasks}
 
-        # Ownership is judged with the exact rules direct construction uses:
-        # mutual bindings for work in progress, historical owners for finished
-        # tasks, and a collected task that may never lack its carrier.
+        # Ownership -- including the completed-task history requirements that
+        # a finished task be collected and name its historical robot -- is
+        # judged with the exact rules direct construction uses, in the single
+        # shared :meth:`_validate_task_ownership`, so the two entry points can
+        # never disagree about this state.
         cls._validate_task_ownership(robots, tasks)
-        for task in tasks:
-            if task.completed and not task.picked_up:
-                raise ValueError(
-                    f"task {task.task_id!r} is completed but never picked up"
-                )
-            if task.picked_up and task.assigned_robot is None:
-                # Direct construction never sees a finished task without a
-                # historical owner because it cannot create completion itself,
-                # but a checkpoint document can spell one, and the running
-                # simulator only ever saves picked-up tasks with a carrier.
-                raise ValueError(
-                    f"task {task.task_id!r} is picked up but has no assigned robot"
-                )
 
         cls._validate_paused_state(paused, task_by_id, robot_by_id, grid)
         cls._validate_active_task_routes(paused, task_by_id, robot_by_id)
