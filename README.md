@@ -189,6 +189,228 @@ dropoff, and a robot that has not collected yet must still pass the pickup).
 Fleets built through either entry point then behave identically: map edits,
 yielding and save/restore apply to them exactly as described below.
 
+## Assigning waiting tasks
+
+`FleetSimulator.assign_tasks()` binds every still-unassigned, unfinished task
+to one robot and stores that robot's planned remaining route. `step()` runs
+the same pass itself at the start of every tick (so a fleet that only ever
+steps still gets assigned), but calling `assign_tasks()` directly between
+ticks lets you inspect exactly which robot each task would get before any
+time passes. Repeating the call changes nothing once every assignable task
+has an owner.
+
+### Processing order and which robots are available
+
+Pending tasks are handled **one at a time in task-id string order** — plain
+lexicographic order on the ids, so the sequence is `"T-1"`, `"T-10"`,
+`"T-2"`, `"T-9"`, never numeric order. For each task the pass looks at the
+robots available *at that moment* and picks one; a robot claimed by a task
+handled earlier in the same pass is no longer a candidate for a later task.
+The result is therefore a greedy, task-by-task allocation, **not** a plan
+that minimizes the fleet's total distance over the whole batch: an earlier
+task can take the robot that would have been ideal for a later one.
+
+A robot is available only when it has **no bound task and no remaining
+route** (`robot.task_id is None` and `robot.route == []`). Watch the common
+misreading next to this rule: a robot with no bound task that is still
+driving a *preset route* is busy, not idle. It is skipped for every task
+even when it is the closest robot to the pickup, and being held up by
+traffic along that route does not make it available either — only
+exhausting the route does. Its waypoints, position and mileage are never
+touched by assignment. Once the route is fully walked, the robot rejoins at
+the *next* assignment pass, planned from wherever it happens to stand.
+
+### How the robot is chosen
+
+For every available robot the pass computes the length of the shortest
+feasible walk on the **current map** from the robot's cell *through the
+pickup point to the dropoff* — two shortest-path legs joined at the pickup
+(the same `shortest_path` exposed publicly). Coordinate distances do not
+enter the decision: straight-line or Manhattan proximity is irrelevant when
+walls force a detour, and ties (and only ties) are broken by robot-id
+**string** order, so `"R-10"` beats `"R-9"`; the digits in an id are never
+read as a number. Other robots' current cells are not obstacles at this
+stage — a planned route may cross another robot, and any conflict is
+settled by the yielding rules while stepping.
+
+A task needs one robot that can walk **both** legs; the whole pickup-then-
+delivery route must exist. A task nobody can currently complete keeps
+waiting: it stays unassigned, occupies no robot and does not stop the pass
+from assigning tasks that come later in id order. This includes the
+easy-to-misread case where the pickup is reachable but the dropoff is not —
+the task is **not** assigned first in the hope that delivery conditions
+later change. Re-run `assign_tasks()` (or simply keep stepping) once the
+map or the fleet changes.
+
+### What an assignment leaves on the entities
+
+The winning robot and the task are bound to each other, and the robot's
+`route` becomes the remaining route:
+
+- a non-empty route never contains the robot's current cell — it starts with
+  the next cell, one orthogonal step away;
+- when the robot is not already standing on the pickup, the route passes
+  through the pickup and ends at the dropoff (it may pass the dropoff early
+  and return after collecting); when it is already on the pickup, the route
+  runs straight to the dropoff;
+- nothing else changes: the clock does not advance, no robot moves, no
+  mileage is added, and goods are neither picked up nor delivered. In
+  particular, standing on the pickup at assignment time does **not** collect
+  — collection happens during `step()`, where a robot on its pickup cell
+  collects first and only then drives.
+
+### Complete example
+
+The map below is 7 cells wide and 5 tall. `#` cells are blocked; the wall at
+`x = 4` has its only gap through `y = 4`, and the obstacles at `(0, 3)` and
+`(1, 4)` seal the free cell `(0, 4)` off from the rest of the map. `N`, `F`
+and `P` are robots; `3p/3d`, `p/d` and `2p/2d` are task points.
+
+```text
+     x=0 x=1 x=2 x=3 x=4 x=5 x=6
+y=0    .   .  3p   .   #   .   .
+y=1    .   .  3d   .   #   .   P
+y=2   2p   .   .   N   #   p   d
+y=3    #   .   .   .   #   .   .
+y=4   2d   #   F   .   .   .   .
+```
+
+- `R-near` (`N`) is idle at `(3, 2)` — only 2 straight-line steps from T-1's
+  pickup, but the wall forces it all the way down to the `y = 4` gap.
+- `R-far` (`F`) is idle at `(2, 4)` — farther on paper, but it approaches
+  the pickup through the gap.
+- `R-preset` (`P`) at `(6, 1)` has no task but is driving the preset route
+  `[(6, 0), (5, 0)]`.
+- T-1: pickup `p = (5, 2)`, dropoff `d = (6, 2)`; T-2: pickup
+  `2p = (0, 2)`, dropoff `2d = (0, 4)` (the sealed cell); T-3: pickup
+  `3p = (2, 0)`, dropoff `3d = (2, 1)`.
+
+```python
+from warehouse_fleet import FleetSimulator, GridMap, Robot, Task, shortest_path
+
+grid = GridMap(
+    width=7,
+    height=5,
+    obstacles=frozenset({(4, 0), (4, 1), (4, 2), (4, 3), (0, 3), (1, 4)}),
+)
+
+robots = [
+    Robot("R-near", (3, 2)),
+    Robot("R-far", (2, 4)),
+    Robot("R-preset", (6, 1), route=[(6, 0), (5, 0)]),
+]
+# The task list is deliberately out of id order; the pass sorts it itself.
+tasks = [
+    Task("T-3", pickup=(2, 0), dropoff=(2, 1)),
+    Task("T-1", pickup=(5, 2), dropoff=(6, 2)),
+    Task("T-2", pickup=(0, 2), dropoff=(0, 4)),
+]
+
+simulator = FleetSimulator(grid, robots, tasks)
+simulator.assign_tasks()
+
+{task.task_id: task.assigned_robot for task in simulator.tasks.values()}
+# {'T-3': 'R-near', 'T-1': 'R-far', 'T-2': None}
+
+r = simulator.robots["R-far"]
+(r.task_id, r.position, r.distance_travelled, r.route)
+# ('T-1', (2, 4), 0, [(3, 4), (4, 4), (5, 4), (5, 3), (5, 2), (6, 2)])
+
+r = simulator.robots["R-near"]
+(r.task_id, r.position, r.distance_travelled, r.route)
+# ('T-3', (3, 2), 0, [(3, 1), (3, 0), (2, 0), (2, 1)])
+
+r = simulator.robots["R-preset"]
+(r.task_id, r.position, r.distance_travelled, r.route)
+# (None, (6, 1), 0, [(6, 0), (5, 0)])  -- skipped, its preset route is intact
+
+simulator.tick                      # 0 -- assignment advances no time
+[(t.task_id, t.picked_up, t.completed) for t in simulator.tasks.values()]
+# [('T-3', False, False), ('T-1', False, False), ('T-2', False, False)]
+```
+
+Reading the result against the map:
+
+1. **T-1 first** (`"T-1"` sorts before `"T-2"`). Its feasible through-pickup
+   route lengths are: `R-near` 7 (down to the gap, across, and back up,
+   versus a straight-line distance of just 2), `R-far` 6 (straight-line 5),
+   and `R-preset` 3 (straight-line 2) — but `R-preset` still has a preset
+   route and is skipped. The robot that *looks* closest therefore loses:
+   **R-far gets T-1**, and its stored route is exactly the walk through the
+   gap shown above.
+2. **T-2 next.** Its pickup `(0, 2)` is reachable (for instance
+   `shortest_path(grid, (3, 2), (0, 2))` is
+   `[(2, 2), (1, 2), (0, 2)]`), but `(0, 4)` is sealed —
+   `shortest_path(grid, (0, 2), (0, 4))` raises `ValueError`. A reachable
+   pickup with an unreachable dropoff is not assignable, so T-2 stays
+   unbound, takes no robot, and does not delay anything.
+3. **T-3 last.** Only `R-near` is still free (`R-far` was claimed by T-1 in
+   this same pass), and its route `(3, 2) → (3, 1) → (3, 0) → (2, 0) →
+   (2, 1)` visits the pickup `(2, 0)` before ending at the dropoff.
+
+Assignment and execution are distinct phases. Directly after
+`assign_tasks()` above the tick is still 0, every robot stands where it
+started, every mileage counter is 0, and no task is picked up or completed.
+One `step()` changes all of that at once:
+
+```python
+simulator.step()
+
+r = simulator.robots["R-far"]
+(r.position, r.distance_travelled, r.route)
+# ((3, 4), 1, [(4, 4), (5, 4), (5, 3), (5, 2), (6, 2)])
+simulator.robots["R-near"].position       # (3, 1)
+simulator.robots["R-preset"].position     # (6, 0) -- its own preset route
+simulator.robots["R-preset"].route        # [(5, 0)]
+simulator.tasks["T-2"].assigned_robot     # None -- still nobody can finish it
+simulator.tasks["T-1"].picked_up          # False -- R-far has not reached p yet
+simulator.tick                            # 1
+```
+
+Each entered cell adds one to mileage and the consumed waypoint disappears
+from the remaining route, which keeps starting at the *next* cell. A robot
+already standing on its pickup when a pass runs is bound and routed but does
+not collect until the step; the step collects first, then moves:
+
+```python
+sim = FleetSimulator(GridMap(3, 1), [Robot("R-1", (0, 0))],
+                     [Task("T-x", pickup=(0, 0), dropoff=(2, 0))])
+sim.assign_tasks()
+sim.tasks["T-x"].picked_up              # False -- assignment never collects
+sim.robots["R-1"].route                 # [(1, 0), (2, 0)]
+sim.step()
+sim.tasks["T-x"].picked_up              # True -- collected before moving
+sim.robots["R-1"].position              # (1, 0)
+sim.robots["R-1"].distance_travelled    # 1
+```
+
+Finally, the two tie/availability edge cases in isolation. A taskless robot
+re-enters a later pass once its preset route is exhausted:
+
+```python
+sim = FleetSimulator(GridMap(4, 1),
+                     [Robot("R-1", (0, 0), route=[(1, 0), (2, 0)])],
+                     [Task("T-1", pickup=(3, 0), dropoff=(2, 0))])
+sim.assign_tasks()
+sim.tasks["T-1"].assigned_robot         # None -- route [(1, 0), (2, 0)] ahead
+sim.step(); sim.step()                  # R-1 walks its preset route to (2, 0)
+sim.assign_tasks()                      # next assignment pass after finishing it
+sim.tasks["T-1"].assigned_robot         # 'R-1'
+sim.robots["R-1"].route                 # [(3, 0), (2, 0)]
+```
+
+And equal feasible lengths are settled by id *strings*, not by the numbers
+inside them:
+
+```python
+sim = FleetSimulator(GridMap(5, 3),
+                     [Robot("R-9", (4, 0)), Robot("R-10", (0, 0))],
+                     [Task("T-1", pickup=(2, 0), dropoff=(2, 2))])
+sim.assign_tasks()
+sim.tasks["T-1"].assigned_robot         # 'R-10' -- both routes have length 4,
+                                        # and "R-10" < "R-9" lexicographically
+```
+
 ## Closing and reopening cells at runtime
 
 Between ticks you may change the map with one batch call. The edit takes effect
