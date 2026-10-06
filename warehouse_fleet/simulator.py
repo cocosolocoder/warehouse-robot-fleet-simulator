@@ -1387,7 +1387,9 @@ class FleetSimulator:
             "completed": sorted(task.task_id for task in self.tasks.values() if task.completed),
         }
         self.replay.append(event)
-        return event
+        # Hand back an independent copy: trimming or editing the returned
+        # frame must never rewrite the history recorded here.
+        return copy.deepcopy(event)
 
     def _finish_if_arrived(self, robot: Robot) -> None:
         if robot.task_id is None:
@@ -1435,7 +1437,11 @@ class FleetSimulator:
             "robots": [asdict(robot) for robot in sorted(self.robots.values(), key=lambda item: item.robot_id)],
             "tasks": [asdict(task) for task in sorted(self.tasks.values(), key=lambda item: item.task_id)],
             "metrics": self.metrics(),
-            "replay": self.replay,
+            # An independent copy of the history: later steps and map edits
+            # extend the simulator's own replay without growing snapshots
+            # already handed out, and edits to a returned snapshot never
+            # reach the recorded history.
+            "replay": copy.deepcopy(self.replay),
         }
 
     # ------------------------------------------------------------------
