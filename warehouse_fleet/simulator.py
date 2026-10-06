@@ -56,6 +56,27 @@ longer facing its recorded blocker on the replanned route loses its entry, an
 entry still facing the same blocker keeps its count, and no edit ever creates
 or increments one.
 
+Initial identifiers
+-------------------
+Identity is per batch and per kind: each robot id may name at most one robot
+in the robot list and each task id at most one task in the task list, while
+the two lists have independent namespaces -- a robot and a task may share one
+string, a task's owner reference is not a second robot record, and any number
+of completed tasks may keep the same historical robot, even one absent from
+the fleet. The identifier alone decides: identical objects passed twice, two
+robots that differ only in position, idle state, preset route or current task,
+and two tasks that differ in pickup/dropoff, owner or completion (one already
+finished beside one still waiting) are all rejected. Nothing keeps one copy,
+merges the records or renames them -- the whole request raises
+:class:`ValueError` saying whether the clash is in the robots or the tasks and
+quoting the duplicated id. The check is read-only and runs before any
+normalization commits, so even a duplicate at the end of either list leaves
+every earlier object -- positions, list-shaped routes and points, bindings,
+mileage and flags -- exactly as supplied; tasks distinct in id but equal in
+pickup/dropoff stay distinct records and both take part in assignment and
+completion statistics. Checkpoint files keep their own pre-existing duplicate
+id rejection unchanged.
+
 Initial task ownership
 ----------------------
 A fleet can be created mid-work: a robot may already name its current task
@@ -561,6 +582,12 @@ class FleetSimulator:
         # The map as built before any runtime edit; map-change history is
         # replayed against this baseline.
         self.base_grid = grid
+        # Identity uniqueness is the first batch check: the same robot id may
+        # name at most one robot in the request and the same task id at most
+        # one task. It is read-only and rejects the whole batch before any
+        # normalization can commit, so a clash leaves every caller object
+        # exactly as supplied. See :meth:`_require_unique_ids`.
+        self._require_unique_ids(robots, tasks)
         # Starting positions share the route coordinates' strict rule: only a
         # list or tuple of two plain integers is accepted (booleans, floats and
         # strings never act as coordinates), and every accepted position is
@@ -614,6 +641,55 @@ class FleetSimulator:
         for task, (pickup, dropoff) in zip(tasks, normalized_task_points):
             task.pickup = pickup
             task.dropoff = dropoff
+
+    @staticmethod
+    def _require_unique_ids(
+        robots: Sequence[Robot], tasks: Sequence[Task]
+    ) -> None:
+        """Reject a batch that names one robot id or task id more than once.
+
+        Each robot id may identify at most one robot within the given robot
+        list, and each task id at most one task within the task list; the two
+        namespaces are independent, so a robot and a task may share one string.
+        The judgement is on the identifiers alone -- nothing else about two
+        records can make a clash legal: identical records handed in twice are
+        still duplicates, as are two robots differing only in position, idle
+        state, preset route or in-flight task, and two tasks differing in
+        pickup/dropoff points, owner or completion state (one finished and one
+        still waiting included). A clash therefore never keeps one record,
+        merges the two or renames anything: the whole request is rejected with
+        a :class:`ValueError` that says whether the clash is among the robots
+        or the tasks and quotes the duplicated id.
+
+        The check is read-only and runs before any normalization commits, so
+        every caller object -- including records preceding a duplicate placed
+        last -- keeps exactly the position, route containers, pickup/dropoff
+        containers, bindings, mileage and flags it arrived with. Checkpoint
+        loading keeps its own pre-existing duplicate rejection and wording in
+        :meth:`_load_entities`.
+        """
+        seen_robot_ids: dict[str, int] = {}
+        for index, robot in enumerate(robots):
+            earlier = seen_robot_ids.get(robot.robot_id)
+            if earlier is not None:
+                raise ValueError(
+                    f"duplicate robot id {robot.robot_id!r} in robot list: "
+                    f"entries {earlier} and {index} both name the same robot; "
+                    "each robot id may appear at most once in a construction "
+                    "request"
+                )
+            seen_robot_ids[robot.robot_id] = index
+        seen_task_ids: dict[str, int] = {}
+        for index, task in enumerate(tasks):
+            earlier = seen_task_ids.get(task.task_id)
+            if earlier is not None:
+                raise ValueError(
+                    f"duplicate task id {task.task_id!r} in task list: "
+                    f"entries {earlier} and {index} both name the same task; "
+                    "each task id may appear at most once in a construction "
+                    "request"
+                )
+            seen_task_ids[task.task_id] = index
 
     @staticmethod
     def _normalize_start_positions(

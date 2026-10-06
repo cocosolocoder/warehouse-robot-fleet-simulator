@@ -86,6 +86,35 @@ Once the route is exhausted on the dropoff cell the task completes, the robot
 is unbound from it (and becomes available for new assignments), and the task
 keeps the id of the robot that finished it.
 
+### Unique identifiers
+
+Each robot id may appear at most once in the robot list and each task id at
+most once in the task list of a construction request; the two lists have
+independent namespaces, so a robot and a task may share one string. The
+identifier alone decides — nothing about the rest of two records can make a
+clash legal:
+
+- two robots with the same id but different positions (or the same position),
+  different idle state, preset routes or current tasks;
+- two tasks with the same id but different pickup/dropoff points, owners or
+  completion state — including one already finished beside one still waiting;
+- the very same object, or an identical copy, passed in twice.
+
+In every such case the whole request is rejected with `ValueError` — the
+message says whether the clash is among the robots or the tasks and quotes the
+duplicated id. No record is kept in preference to another, nothing is merged,
+and nothing is renamed. The check is read-only and runs before any other
+normalization commits, so even a duplicate at the end of either list leaves
+every earlier `Robot` and `Task` exactly as supplied — positions, list-shaped
+routes and points, bindings, mileage and completion flags all keep their
+original containers and values.
+
+A task's `assigned_robot` is only a reference, never a second robot entry:
+several completed tasks may keep the same historical robot, which may even be
+absent from the fleet. Conversely, tasks with distinct ids but identical
+pickup/dropoff points are separate tasks — both are kept, assigned and counted
+independently.
+
 ### Ownership of in-flight tasks
 
 Work still in progress must be bound consistently in both directions: a robot
