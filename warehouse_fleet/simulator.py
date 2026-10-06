@@ -102,6 +102,29 @@ point; checkpoint loading additionally keeps its own stricter route checks
 (including the task completion rules), its format and the map-paused
 behaviour, under which a paused robot resumes with an empty route.
 
+Every robot's starting position is validated by the same two-plain-integers
+coordinate rule before any map or overlap check can touch it: the direct
+Python interface accepts a list or a tuple of exactly two plain integers
+(the spellings may be mixed within one fleet), while checkpoint recovery
+keeps its strict JSON-list format. Booleans, floats, strings, pairs of the
+wrong length and anything that cannot denote a coordinate pair raise
+:class:`ValueError` naming the robot and its starting position -- never a
+``TypeError`` from tuple unpacking or set hashing, and nothing is rounded,
+coerced or padded into legality. A legal start still has to lie inside the
+map and off every obstacle, and no two robots may occupy the same start
+cell; overlap is judged by coordinate value across container spellings, and
+the error names both conflicting robots. The rule applies to every robot,
+taskless, task-bound or preset-route alike. On success each robot's public
+position is a fresh integer tuple, so ``[0, 0]`` and ``(0, 0)`` produce the
+same fleet, movement and assignments, the caller keeps full ownership of its
+original coordinate list, and later edits to that list cannot move the
+created robot. Positions, routes, ownership and the rest of the fleet are
+all validated before any of it is committed, so a failure on a later robot
+-- a bad route or a bad task binding even after every position checked out
+-- leaves the caller's robots and tasks exactly as passed in, earlier
+robots' positions and remaining routes included. Construction itself never
+advances the clock, moves a robot, adds mileage or records replay history.
+
 Direct construction always judges every waypoint against the map handed to
 it, so a route crossing an initial obstacle is rejected no matter the robot's
 task state. Checkpoint recovery owns exactly one relaxation, and only for a
@@ -520,11 +543,34 @@ class FleetSimulator:
         # Consecutive per-robot waits caused purely by other robots:
         # robot_id -> {"blocked_by": [robot_id, ...], "ticks": int}.
         self._traffic_waits: dict[str, dict[str, object]] = {}
-        positions = [robot.position for robot in robots]
-        if len(positions) != len(set(positions)):
-            raise ValueError("robots cannot share an initial position")
-        if any(not grid.traversable(position) for position in positions):
-            raise ValueError("robot starts outside traversable map space")
+        # Every starting position is validated and normalized before any other
+        # check uses it: a legal start is a list or tuple of two plain integers
+        # (booleans are not integers, floats and strings are never coerced), and
+        # the robot's public position is committed as a fresh integer tuple so
+        # the caller's own list is neither aliased nor mutated. The copies are
+        # built read-only here and committed only further below, after every
+        # robot and task passed, so a later rejection leaves the caller's
+        # objects exactly as supplied. See :meth:`_normalize_initial_positions`.
+        normalized_positions = self._normalize_initial_positions(robots)
+        positions = list(normalized_positions.values())
+        seen: dict[Position, str] = {}
+        for robot, position in zip(robots, positions):
+            owner = seen.get(position)
+            if owner is not None:
+                # Overlap is judged by coordinate value, never by container
+                # spelling: a list start and a tuple start with the same
+                # components are the same cell, and the error names both robots
+                # involved so the conflicting pair can be found.
+                raise ValueError(
+                    f"robots {owner!r} and {robot.robot_id!r} share initial "
+                    f"position {list(position)}"
+                )
+            seen[position] = robot.robot_id
+            if not grid.traversable(position):
+                raise ValueError(
+                    f"robot {robot.robot_id!r} starts at {list(position)}, "
+                    "which is outside the map or inside an obstacle"
+                )
         self._validate_task_ownership(robots, tasks)
         if _routes_prevalidated:
             # Checkpoint recovery has already run the shared
@@ -533,16 +579,65 @@ class FleetSimulator:
             # a history-explained closed cell -- so its already-normalized
             # routes must not be re-checked here against the saved grid, where
             # those legitimate waypoints look obstructed. Every other
-            # constructor check above still runs.
+            # constructor check above still runs; positions are committed like
+            # the direct-construction path below.
+            self._commit_initial_positions(robots, normalized_positions)
             return
         # Accepted routes share one internal shape regardless of how the caller
         # spelled them: a mutable list of tuple cells. The normalized copies are
         # committed only after every robot passed validation, so a rejection
         # (even one buried in a later robot's route) never touches the caller's
         # objects. See :meth:`_normalize_initial_routes`.
-        normalized_routes = self._normalize_initial_routes(grid, robots)
+        normalized_routes = self._normalize_initial_routes(
+            grid, robots, normalized_positions
+        )
+        self._commit_initial_positions(robots, normalized_positions)
         for robot, route in zip(robots, normalized_routes):
             robot.route = route
+
+    @staticmethod
+    def _commit_initial_positions(
+        robots: Sequence[Robot], positions: Mapping[str, Position]
+    ) -> None:
+        """Commit validated starting positions onto the shared robot objects.
+
+        Runs only once the whole fleet has passed every check, so construction
+        never leaves a partially normalized robot behind.
+        """
+        for robot in robots:
+            robot.position = positions[robot.robot_id]
+
+    @staticmethod
+    def _normalize_initial_positions(
+        robots: Sequence[Robot],
+    ) -> dict[str, Position]:
+        """Validate starting positions and return fresh integer tuple copies.
+
+        Both construction entry points rely on this before they touch anything
+        else, so a malformed start can never reach the overlap and map checks
+        as a boolean, a float or an unhashable list and leak a ``TypeError``
+        instead of the :class:`ValueError` the fleet's other validation raises.
+        Each position must be a list or tuple (the two spellings may be mixed
+        freely within one batch) holding exactly two plain integers --
+        :class:`bool` is rejected even though it is a Python ``int``, floats and
+        strings are never rounded or coerced, and wrong lengths are not padded.
+        Anything else -- a bare number, a string of the right length, a
+        generator, a set -- is rejected as something that cannot denote a
+        coordinate pair. Every error names the robot and its starting position.
+
+        The result is keyed by robot id and holds freshly built tuples, so a
+        caller that keeps mutating its original coordinate list after a
+        successful construction cannot move the created robot: the fleet owns no
+        reference to that list. This stage validates shape only; map bounds,
+        obstacles and pairwise overlap are judged by the caller afterwards.
+        """
+        normalized: dict[str, Position] = {}
+        for robot in robots:
+            position = _as_cell(
+                robot.position, f"robot {robot.robot_id!r} starting position"
+            )
+            normalized[robot.robot_id] = position
+        return normalized
 
     @staticmethod
     def _validate_task_ownership(robots: Sequence[Robot], tasks: Sequence[Task]) -> None:
@@ -649,7 +744,9 @@ class FleetSimulator:
 
     @staticmethod
     def _normalize_initial_routes(
-        grid: GridMap, robots: Sequence[Robot]
+        grid: GridMap,
+        robots: Sequence[Robot],
+        positions: Mapping[str, Position],
     ) -> list[list[Position]]:
         """Validate every remaining route and return normalized copies.
 
@@ -662,6 +759,12 @@ class FleetSimulator:
         wrong lengths or element types raise :class:`ValueError` instead of
         leaking unpacking or hashing failures. The forms may be mixed freely;
         only the coordinate order matters, not the container types.
+
+        Each walk starts from the robot's already normalized tuple position in
+        *positions*, not the caller's possibly-list spelling: Python treats a
+        list and a tuple as unequal even with equal components, so walking the
+        raw object would let a first waypoint on the current cell escape the
+        dedicated equal-cell rejection when the start came in as a list.
 
         Accepted routes are returned as mutable lists of tuple cells, the one
         shape the rest of the engine relies on (head consumption with
@@ -691,7 +794,7 @@ class FleetSimulator:
             normalized.append(
                 _validate_route_walk(
                     grid,
-                    robot.position,
+                    positions[robot.robot_id],
                     route,
                     robot_id=robot.robot_id,
                     checkpoint=False,
