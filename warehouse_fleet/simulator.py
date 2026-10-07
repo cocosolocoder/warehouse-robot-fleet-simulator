@@ -1087,41 +1087,107 @@ class FleetSimulator:
         origin = robot.position if start is None else start
         return _plan_task_route(self.grid, origin, task)
 
+    def _bound_task_robot(self, task: Task) -> Robot | None:
+        """The robot currently executing *task*, when the binding is live work.
+
+        This is the single eligibility rule behind every task-route refresh:
+        only an assigned, unfinished task whose named robot names the task back
+        may have its remaining route replaced. A completed task is fixed
+        history, an unassigned task goes through the ordinary assignment pass,
+        and a task whose owner is missing from the fleet or executing another
+        task -- a state normal running never produces -- is left alone rather
+        than handed a route.
+        """
+        if task.completed or task.assigned_robot is None:
+            return None
+        robot = self.robots.get(task.assigned_robot)
+        if robot is None or robot.task_id != task.task_id:
+            return None
+        return robot
+
+    def _refresh_bound_task_route(self, task: Task, robot: Robot) -> bool:
+        """Re-plan *robot*'s remaining route for *task* on the current map.
+
+        One rule backs every place that must bring a bound task's route in line
+        with the map -- obstacle edits (:meth:`_reroute_after_map_change`),
+        step-time recovery of map-paused work (:meth:`_recover_paused_tasks`)
+        and the defensive in-step replan -- so feasibility, the stored route
+        and the pause record are updated together here instead of by
+        hand-written copies that could drift apart:
+
+        * the shortest feasible walk is planned from the robot's current cell
+          through the points the task still needs: pickup and then dropoff
+          before collection, the dropoff alone afterwards -- even when the old
+          pickup cell has since been closed (:func:`_plan_task_route` owns that
+          waypoint rule). Equal-length choices keep their deterministic tie
+          order, and the route lists only the cells ahead of the robot; its
+          current cell is never a pending waypoint;
+        * when every required point is reachable the planned route replaces the
+          old one and the task leaves the map-pause set. An empty list is a
+          feasible zero-step route -- the robot already stands where it needs
+          to be -- not an unreachable pause. Pickup and delivery are still
+          confirmed only while stepping, including when pickup and dropoff
+          coincide;
+        * when a required point is unreachable the remaining route is cleared
+          and the task is recorded as map-paused, while the mutual task/robot
+          binding and the existing picked-up flag are kept untouched.
+
+        Planning itself never advances the clock, moves the robot, adds mileage
+        or collects the goods. The return value says whether the task is
+        feasible now; callers own anything that should follow a resumed task.
+        """
+        route = self._plan_route(robot, task)
+        if route is None:
+            robot.route = []
+            self.paused_tasks.add(task.task_id)
+            return False
+        robot.route = route
+        self.paused_tasks.discard(task.task_id)
+        return True
+
     def _reroute_after_map_change(self) -> None:
+        """Refresh every bound task's route right after an accepted map edit.
+
+        Assigned, unfinished tasks keep their original robot and are replanned
+        against the new map through :meth:`_refresh_bound_task_route` --
+        including tasks currently paused, which is how reopening a path resumes
+        them immediately on the edit instead of sending them back to the
+        assignment competition. Taskless robots deliberately stay out of this
+        rule: a preset route keeps its exact waypoint order and waits before a
+        newly closed cell, so it is neither cleared nor replanned here.
+        """
         for task in self.tasks.values():
-            if task.completed or task.assigned_robot is None:
-                continue
-            robot = self.robots[task.assigned_robot]
-            if robot.task_id != task.task_id:
-                continue
-            route = self._plan_route(robot, task)
-            if route is None:
-                robot.route = []
-                self.paused_tasks.add(task.task_id)
-            else:
-                # Only the route is refreshed here; pickup/delivery are
-                # confirmed at step start (or were already recorded).
-                robot.route = route
-                self.paused_tasks.discard(task.task_id)
+            robot = self._bound_task_robot(task)
+            if robot is not None:
+                self._refresh_bound_task_route(task, robot)
 
     def _recover_paused_tasks(self) -> None:
-        """Resume tasks suspended by map unreachability where possible."""
+        """Resume map-paused tasks that the current map lets finish.
+
+        This runs at the start of every tick, before ordinary assignment, so a
+        paused task keeps its own robot -- it never re-enters the waiting-task
+        pool -- and is replanned on the current map with its current pickup
+        state by the very same rule an obstacle edit uses
+        (:meth:`_refresh_bound_task_route`); closing and reopening paths can
+        therefore never disagree with tick-time recovery about routes or pause
+        records. A still-unreachable task keeps its empty route and its pause;
+        a pause record that names work no longer bound (normal running never
+        creates one) is dropped. A resumed task whose feasible route has zero
+        remaining steps -- for example a loaded robot back at its dropoff, or
+        coincident pickup/dropoff points -- is confirmed through the ordinary
+        arrival rule on this same step instead of idling for a tick.
+        """
         for task_id in sorted(self.paused_tasks):
             task = self.tasks.get(task_id)
-            if task is None or task.completed or task.assigned_robot is None:
+            if task is None:
                 self.paused_tasks.discard(task_id)
                 continue
-            robot = self.robots[task.assigned_robot]
-            if robot.task_id != task.task_id:
+            robot = self._bound_task_robot(task)
+            if robot is None:
                 self.paused_tasks.discard(task_id)
                 continue
-            route = self._plan_route(robot, task)
-            if route is None:
-                robot.route = []
-                continue
-            robot.route = route
-            self.paused_tasks.discard(task_id)
-            self._finish_if_arrived(robot)
+            if self._refresh_bound_task_route(task, robot):
+                self._finish_if_arrived(robot)
 
     # ------------------------------------------------------------------
     # Traffic conflicts and yielding
@@ -1655,13 +1721,10 @@ class FleetSimulator:
             destination = robot.route[0]
             if not self.grid.traversable(destination):
                 # Defensive: routes are normally replanned on every map edit.
+                # The same feasibility/route/pause rule an accepted edit and
+                # step-start recovery use settles it here too.
                 if task is not None and not task.completed:
-                    route = self._plan_route(robot, task)
-                    if route is None:
-                        robot.route = []
-                        self.paused_tasks.add(task.task_id)
-                    else:
-                        robot.route = route
+                    self._refresh_bound_task_route(task, robot)
                 continue
             blocker_id = occupied.get(destination)
             if blocker_id is None:
