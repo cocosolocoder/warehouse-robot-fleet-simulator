@@ -9,6 +9,14 @@ Position = tuple[int, int]
 
 @dataclass(frozen=True, slots=True)
 class GridMap:
+    """A fixed width/height grid with the obstacles captured at construction.
+
+    ``obstacles`` accepts a set, frozenset or any other iterable of cells but
+    always stores a fresh ``frozenset`` snapshot: keeping and mutating the
+    original container afterwards never changes this map, and the stored
+    attribute offers no mutation methods of its own.
+    """
+
     width: int
     height: int
     obstacles: frozenset[Position] = frozenset()
@@ -16,8 +24,21 @@ class GridMap:
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0:
             raise ValueError("map dimensions must be positive")
-        if any(not self.contains(cell) for cell in self.obstacles):
+        # Snapshot the caller's obstacles as a fresh frozenset instead of
+        # keeping the container it was built from. A map is the fixed layout
+        # of its construction moment: a caller that keeps mutating its original
+        # set afterwards -- adding, removing or clearing cells -- must never
+        # edit an existing map, and the frozen type means the stored attribute
+        # offers no add/remove/clear of its own. object.__setattr__ is required
+        # because the dataclass itself is frozen. A set, frozenset or any other
+        # iterable of cells is accepted, and building a map never writes back
+        # to the caller's container; the same source reused for several maps
+        # therefore leaves each map with the cells it saw at its own
+        # construction.
+        obstacles = frozenset(self.obstacles)
+        if any(not self.contains(cell) for cell in obstacles):
             raise ValueError("obstacle lies outside the map")
+        object.__setattr__(self, "obstacles", obstacles)
 
     def contains(self, position: Position) -> bool:
         x, y = position

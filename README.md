@@ -189,6 +189,25 @@ dropoff, and a robot that has not collected yet must still pass the pickup).
 Fleets built through either entry point then behave identically: map edits,
 yielding and save/restore apply to them exactly as described below.
 
+### The map is fixed at construction
+
+A `GridMap` keeps exactly the obstacle layout it was created with. The
+`obstacles` argument may be a `set` or a `frozenset` (or any iterable of
+`[x, y]` cells); an empty collection and an omitted argument both mean a map
+with no obstacles. Whatever container is passed, its cells are snapshotted into
+an immutable `frozenset` while the map is built, so later changes to your own
+container — adding a cell, discarding one or clearing the whole set — never
+reach an existing map: its traversability and every `shortest_path` result
+still reflect creation time, and construction never writes back to the
+container. `grid.obstacles` is itself a `frozenset`, so calling `add`,
+`remove` or `clear` on it raises `AttributeError`; runtime closures and
+reopenings go through `modify_obstacles()` only. The same source set may be
+reused to build several maps, and each map freezes the cells the set held at
+that map's own construction. The isolation holds from the moment the map
+exists — even before any fleet is created — so a fleet built later validates
+its robots' starting positions and routes against the frozen map, and editing
+one fleet's map never changes another fleet's initial map.
+
 ## Assigning waiting tasks
 
 `FleetSimulator.assign_tasks()` binds every still-unassigned, unfinished task
