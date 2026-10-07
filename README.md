@@ -511,6 +511,18 @@ most one orthogonal cell per tick (or waits), robots never share a cell at
 the end of a tick, never swap places within one tick, and never enter an
 obstacle.
 
+A robot that completes a task on a tick keeps the dropoff cell for the rest
+of that very tick. The task first appears in that tick's `completed` list, so
+the executing robot — whether it walked onto the dropoff to finish or was
+already standing there and finished without moving — must still be on the
+dropoff when the tick ends: it is neither asked to yield nor pushed aside by
+another robot requesting the cell, even when a free neighbouring cell
+exists, and a blocked requester simply records a traffic wait for that tick.
+The hold lasts one tick only; from the next tick on the released robot is an
+ordinary parked robot that yields normally, so finishing a delivery never
+turns into permanently occupying the dropoff, and a task that is already
+completed is history that never restricts anyone's later moves.
+
 A sidestep that cannot make progress is not taken. If the replanned route
 steps straight back through the cell the robot is vacating, still runs past
 the same blocker's cell, and the blocker cannot use the opening to get out of

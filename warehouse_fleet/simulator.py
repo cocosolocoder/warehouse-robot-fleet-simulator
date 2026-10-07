@@ -647,6 +647,15 @@ class FleetSimulator:
         # :meth:`_settle_traffic_waits`; the ``blocked_by`` list shape exists
         # only at the report/checkpoint boundary.
         self._traffic_waits: dict[str, tuple[str, int]] = {}
+        # Robots that have completed a task during the step currently in
+        # progress. When a task first shows up in a tick's ``completed`` list,
+        # its delivery robot must still stand on that task's dropoff when the
+        # tick ends, so for the rest of that tick the robot is never asked to
+        # yield, never pushed off the cell, and hypothetical leave checks never
+        # count it as able to clear the way. The next tick starts with this set
+        # empty, so ordinary idle and yielding behaviour resumes; it is purely
+        # tick-local and is never part of a checkpoint.
+        self._just_finished: set[str] = set()
         self._validate_task_ownership(robots, tasks)
         if _routes_prevalidated:
             # Checkpoint recovery has already run the shared
@@ -1447,6 +1456,12 @@ class FleetSimulator:
             task = self.tasks[current.task_id] if current.task_id is not None else None
             if task is not None and task.task_id in self.paused_tasks:
                 continue
+            if current.robot_id in self._just_finished:
+                # The robot has delivered a task on this tick and must still
+                # stand on that task's dropoff when the tick ends: it neither
+                # yields nor drives on within the tick, so the dependency chain
+                # must never treat its cell as one that can be vacated.
+                continue
             if not current.route:
                 if task is not None:
                     # A busy robot with no route left only arrives/finishes this
@@ -1682,6 +1697,11 @@ class FleetSimulator:
                 task.picked_up = True
 
     def step(self) -> dict[str, object]:
+        # Tick-local protection for robots that deliver on this tick; a
+        # completion recovered from a map pause at the start of the tick is a
+        # completion of this tick too, so the set is cleared before the
+        # recovery pass rather than after it.
+        self._just_finished = set()
         self._confirm_pickups()
         self._recover_paused_tasks()
         self.assign_tasks()
@@ -1738,13 +1758,20 @@ class FleetSimulator:
             # map-unreachability pause and the task stays active.
             blocker = self.robots[blocker_id]
             if blocker_id not in moved_ids:
-                if blocker.task_id is None and not blocker.route:
+                if (
+                    blocker.task_id is None
+                    and not blocker.route
+                    and blocker_id not in self._just_finished
+                ):
                     # Truly parked blocker: no bound task and no remaining
                     # route. Ask it to yield onto a free side cell, then take
                     # over the cell it vacated. A taskless robot that still has
                     # a remaining route is not parked: it drives that route
                     # cell by cell like any other moving robot and is never
-                    # pushed off it for a requester.
+                    # pushed off it for a requester. A robot that has just
+                    # delivered on this tick looks parked too, but the
+                    # first-completion evidence requires it to end the tick on
+                    # the dropoff, so it keeps the cell until the next tick.
                     side = self._idle_sidestep_cell(blocker, robot, occupied, reserved)
                     if side is not None:
                         relocate(blocker, side)
@@ -1801,6 +1828,11 @@ class FleetSimulator:
             task.completed = True
             self.paused_tasks.discard(task.task_id)
             robot.task_id = None
+            # Hold the delivery robot on the dropoff for the remainder of this
+            # tick: the task first appears in this tick's ``completed`` list, so
+            # the replay evidence (and checkpoint loading) require it to still
+            # stand on the dropoff at tick end. The set is reset at every step.
+            self._just_finished.add(robot.robot_id)
 
     def metrics(self) -> dict[str, object]:
         completed = sum(task.completed for task in self.tasks.values())
