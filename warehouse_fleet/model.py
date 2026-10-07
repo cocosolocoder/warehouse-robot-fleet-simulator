@@ -14,6 +14,13 @@ class GridMap:
     obstacles: frozenset[Position] = frozenset()
 
     def __post_init__(self) -> None:
+        # Snapshot the caller's obstacle collection into a frozenset the
+        # moment the map is created: a map keeps the content it was built
+        # with, so mutating (or clearing) the original set afterwards never
+        # rewrites this map, and the declared frozenset type genuinely holds
+        # -- the map itself is never edited through the caller's container,
+        # and construction never mutates the caller's collection either.
+        object.__setattr__(self, "obstacles", frozenset(self.obstacles))
         if self.width <= 0 or self.height <= 0:
             raise ValueError("map dimensions must be positive")
         if any(not self.contains(cell) for cell in self.obstacles):

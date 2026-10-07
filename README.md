@@ -23,6 +23,14 @@ python3 -m unittest discover -s tests -v
 The public Python API exposes `GridMap`, `Robot`, `Task`, `FleetSimulator`, and
 `shortest_path` for programmatic scenarios.
 
+A `GridMap` is immutable from the moment it is created: the obstacle
+collection handed to the constructor (a `set`, a `frozenset`, or omitted for
+no obstacles) is snapshotted into a `frozenset`, so mutating or clearing the
+caller's original collection afterwards never rewrites an existing map, and
+construction never modifies the caller's collection either. The only way a
+fleet's map changes is a formal `FleetSimulator.modify_obstacles` edit, which
+is what the map-change history records.
+
 ## Taking over in-flight work
 
 A fleet does not have to start idle: `FleetSimulator` accepts robots and tasks
