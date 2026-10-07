@@ -632,7 +632,23 @@ cell at a tick boundary, a jump of more than one orthogonal cell or a two-robot
 cell swap between neighboring tick frames, and a `moved` list that names an
 unknown/duplicated robot or does not exactly match the robots that changed
 position (following another robot into the cell it just vacated is legal, and
-the list need not be sorted). Map edits are judged against contemporary
+the list need not be sorted). A completion list is checked at the moment each
+task was first finished as well: from the second tick frame on, every task
+newly appearing in a frame's `completed` list must have its retained delivery
+robot present in that frame's robot positions and standing on the task's
+dropoff cell. A missing delivery robot or a mismatched cell rejects the
+document, with the error naming the frame, the task, the robot and the
+reason. The judgement uses the first frame only — the robot's saved current
+position is never accepted in place of it, the robot may drive off and take
+other work after delivering, and later frames that keep listing the task do
+not have to show it parked at the dropoff; a robot can finish during a tick
+in which it does not move and need not appear in that frame's `moved` list.
+Completions already present in the first tick frame may come from before the
+recording started: they are not investigated, their historical delivery
+robot need no longer be in the fleet, and a zero-tick checkpoint with
+initially completed tasks loads the same way. Map edits are not time steps
+and cannot replace the position evidence of the completion's own frame.
+Map edits are judged against contemporary
 positions: a cell a robot once passed through may be closed later without
 invalidating the replay, a robot may not appear in a cell before it opens, and
 an edit may not add an obstacle onto a cell occupied when that tick ended —

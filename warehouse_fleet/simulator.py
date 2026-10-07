@@ -228,7 +228,14 @@ version is ``2``; version ``1`` files remain readable.
     ``completed`` is the cumulative set of tasks finished by the end of that
     tick: entries must name checkpoint tasks without repeats within one frame,
     a recorded completion must survive every later frame, and the final
-    frame's set must equal the tasks saved with ``completed: true``.
+    frame's set must equal the tasks saved with ``completed: true``. From the
+    second tick frame on, a task newly appearing in the list is additionally
+    checked against the moment of its first finish: the task's retained
+    delivery robot must be present in that frame's positions and standing on
+    the task dropoff -- judged once, on that first frame, so the robot may
+    drive away afterwards and later frames repeating the task prove nothing
+    more; completions already present in the first frame may predate the
+    recording and are not second-guessed.
     Map-change events sit between ticks (or after the last tick) and look like
     ``{"type": "map_change", "tick": int, "sequence": int,
     "added": [[x, y], ...], "removed": [[x, y], ...]}``. When ``tick`` is
@@ -278,7 +285,8 @@ bounds/obstructed positions and routes, non-adjacent route steps, ownership
 mismatches, routes that cannot finish the robot's bound task, traffic waits
 that contradict the saved robot positions and remaining routes, broken replay
 or map-change history, a completion history that contradicts the saved task
-states, and a history that does not reproduce the saved grid all raise
+states, a completion recorded away from its dropoff cell, and a history that
+does not reproduce the saved grid all raise
 :class:`ValueError`.
 
 The single route-walk exception recovery allows is a preset-route robot that
@@ -322,7 +330,21 @@ applied in their recorded order after the tick they are stamped on, so a
 robot may be recorded in a cell that is closed later, may not appear in a
 cell before it opens, and no change may add an obstacle onto a cell a tick
 frame shows occupied -- not even when a later change of the same tick removes
-it. Filesystem and permission failures propagate as :class:`OSError`.
+it. The completion lists are checked at the moment each task was first
+finished, too: from the second tick frame on, every task newly appearing in a
+frame's ``completed`` list must have its retained delivery robot present in
+that same frame, standing on the task dropoff cell; a robot missing from the
+frame or recorded elsewhere rejects the document, naming the frame, the task,
+the robot and the contradiction. Only that first frame is evidence -- the
+saved current position is never substituted, the robot may leave the dropoff
+(or take other work) in later frames without invalidating the record, and
+later frames repeating the task do not have to show the robot parked there;
+finishing during a no-move tick is legal and needs no ``moved`` entry. The
+first tick frame's completions may originate before recording began, so they
+-- and the completed tasks of a zero-tick checkpoint -- keep their historical
+exemption, including a delivery robot absent from the fleet, and a map change
+is not a time step that can supply the missing frame. Filesystem and
+permission failures propagate as :class:`OSError`.
 """
 
 from __future__ import annotations
@@ -2070,7 +2092,7 @@ class FleetSimulator:
         # alongside the frames so each frame is judged against its contemporary
         # map.
         cls._validate_replay_positions(replay, tick, robot_by_id, base_grid, map_changes)
-        cls._validate_replay_completion(replay, tick, task_by_id)
+        cls._validate_replay_completion(replay, tick, task_by_id, robot_by_id)
         return simulator
 
     @staticmethod
@@ -2886,6 +2908,7 @@ class FleetSimulator:
         replay: Sequence[Mapping[str, object]],
         tick: int,
         task_by_id: Mapping[str, Task],
+        robot_by_id: Mapping[str, Robot],
     ) -> None:
         """Reject completion histories that contradict the saved task states.
 
@@ -2897,17 +2920,31 @@ class FleetSimulator:
         order inside a frame carries no meaning, and repeating the same task
         across frames is the normal case. The last frame must therefore list
         exactly the tasks saved as completed; anything else means the restored
-        completion count would differ from what the replay shows. Map-change
-        events are not time steps and take no part in this check, so edits
-        stamped after the final tick cannot excuse a mismatch. A checkpoint
-        still at tick 0 has no frames to judge: it loads as saved, completed
-        initial tasks included, and the first recorded frame may list
-        completions without any earlier empty frame.
+        completion count would differ from what the replay shows.
+
+        From the second tick frame on, a task newly appearing in the list is
+        also checked against the moment it was first finished: the task's
+        retained delivery robot must be present in that very frame's robot
+        positions and must stand on the task dropoff cell. The judgement uses
+        the first frame only -- a robot that drives away after delivering, or
+        works another task, keeps the completion valid, and later frames
+        repeating the task are never asked to park the robot back on the
+        dropoff -- and never uses the robot's saved current position as a
+        substitute. A robot may finish a task in a tick where it never moves,
+        so membership in the frame's ``moved`` list is irrelevant. The first
+        tick frame is exempt: completions already listed there may predate the
+        recording, so neither their dropoff presence nor the continued
+        existence of their historical robot is second-guessed; the same
+        exemption covers a zero-tick checkpoint with initially completed tasks.
+        Map-change events are not time steps, take no part in this check, and
+        cannot stand in for the position evidence of the tick frame the
+        completion actually appears in.
         """
         known_ids = set(task_by_id)
         previous: set[str] = set()
         last_completed: set[str] | None = None
         last_frame_tick = 0
+        first_frame = True
         for frame in replay:
             if frame.get("type") != "tick":
                 continue
@@ -2935,9 +2972,40 @@ class FleetSimulator:
                     "completed list; a recorded completion must survive every "
                     "later tick"
                 )
+            if not first_frame:
+                # Every task newly finished in this frame must have been
+                # delivered on the dropoff cell recorded for this exact tick;
+                # completions carried over from earlier frames are historical
+                # already and need no renewed position evidence. A task that
+                # is not itself saved as completed is left to the existing
+                # completion-dropped or final-set mismatch rule, which keeps
+                # owning that contradiction and its error wording.
+                for task_id in sorted(seen - previous):
+                    task = task_by_id[task_id]
+                    if not task.completed:
+                        continue
+                    robot_id = task.assigned_robot
+                    if robot_id is None or robot_id not in robot_by_id:
+                        raise ValueError(
+                            f"replay frame {frame_tick} newly lists task "
+                            f"{task_id!r} completed, but its recorded delivery "
+                            f"robot {robot_id!r} is missing from that frame's "
+                            "robot positions"
+                        )
+                    raw_positions = frame["robots"]
+                    assert isinstance(raw_positions, dict)
+                    position = tuple(raw_positions[robot_id])
+                    if position != task.dropoff:
+                        raise ValueError(
+                            f"replay frame {frame_tick} newly lists task "
+                            f"{task_id!r} completed, but its recorded delivery "
+                            f"robot {robot_id!r} was at {list(position)}, not at "
+                            f"the task dropoff {list(task.dropoff)}"
+                        )
             previous = seen
             last_completed = seen
             last_frame_tick = frame_tick
+            first_frame = False
 
         if tick == 0 or last_completed is None:
             return
