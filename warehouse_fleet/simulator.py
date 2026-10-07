@@ -1087,6 +1087,42 @@ class FleetSimulator:
         origin = robot.position if start is None else start
         return _plan_task_route(self.grid, origin, task)
 
+    def _refresh_task_route(self, robot: Robot, task: Task) -> bool:
+        """Replan *robot*'s remaining route for *task* on the current map.
+
+        This is the single place that owns the route-refresh rule shared by
+        obstacle edits (:meth:`_reroute_after_map_change`), paused-task
+        recovery (:meth:`_recover_paused_tasks`) and the defensive replan in
+        :meth:`step`, so the reachability judgement, the route replacement and
+        the pause bookkeeping are never maintained in parallel copies:
+
+        * The task keeps its robot and its collected-goods state either way;
+          only the remaining route and the pause record change. A robot that
+          has not collected yet is replanned through the pickup and then the
+          dropoff; a loaded robot routes straight to the dropoff and is never
+          sent back to a since-closed pickup cell (see
+          :func:`_plan_task_route`).
+        * Reachable: the robot's route is replaced by the freshly planned
+          shortest route (cells after the current position only, empty when
+          the robot already stands on the only required cell -- a feasible
+          zero-step route, not an unreachable one) and the task leaves the
+          paused set. Planning alone never collects goods or completes the
+          task; pickup and delivery are confirmed while stepping.
+        * Unreachable: the remaining route is cleared and the task is listed
+          as paused by map unreachability, keeping the mutual robot/task
+          binding intact so the task never re-enters assignment competition.
+
+        Returns whether the task is executable on the current map.
+        """
+        route = self._plan_route(robot, task)
+        if route is None:
+            robot.route = []
+            self.paused_tasks.add(task.task_id)
+            return False
+        robot.route = route
+        self.paused_tasks.discard(task.task_id)
+        return True
+
     def _reroute_after_map_change(self) -> None:
         for task in self.tasks.values():
             if task.completed or task.assigned_robot is None:
@@ -1094,15 +1130,9 @@ class FleetSimulator:
             robot = self.robots[task.assigned_robot]
             if robot.task_id != task.task_id:
                 continue
-            route = self._plan_route(robot, task)
-            if route is None:
-                robot.route = []
-                self.paused_tasks.add(task.task_id)
-            else:
-                # Only the route is refreshed here; pickup/delivery are
-                # confirmed at step start (or were already recorded).
-                robot.route = route
-                self.paused_tasks.discard(task.task_id)
+            # Only the route is refreshed here; pickup/delivery are confirmed
+            # at step start (or were already recorded).
+            self._refresh_task_route(robot, task)
 
     def _recover_paused_tasks(self) -> None:
         """Resume tasks suspended by map unreachability where possible."""
@@ -1115,13 +1145,8 @@ class FleetSimulator:
             if robot.task_id != task.task_id:
                 self.paused_tasks.discard(task_id)
                 continue
-            route = self._plan_route(robot, task)
-            if route is None:
-                robot.route = []
-                continue
-            robot.route = route
-            self.paused_tasks.discard(task_id)
-            self._finish_if_arrived(robot)
+            if self._refresh_task_route(robot, task):
+                self._finish_if_arrived(robot)
 
     # ------------------------------------------------------------------
     # Traffic conflicts and yielding
@@ -1655,13 +1680,10 @@ class FleetSimulator:
             destination = robot.route[0]
             if not self.grid.traversable(destination):
                 # Defensive: routes are normally replanned on every map edit.
+                # The task cannot be paused here (paused robots were skipped
+                # above), so the shared refresh only ever replans or pauses.
                 if task is not None and not task.completed:
-                    route = self._plan_route(robot, task)
-                    if route is None:
-                        robot.route = []
-                        self.paused_tasks.add(task.task_id)
-                    else:
-                        robot.route = route
+                    self._refresh_task_route(robot, task)
                 continue
             blocker_id = occupied.get(destination)
             if blocker_id is None:
