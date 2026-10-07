@@ -31,6 +31,25 @@ construction never modifies the caller's collection either. The only way a
 fleet's map changes is a formal `FleetSimulator.modify_obstacles` edit, which
 is what the map-change history records.
 
+Construction validates its inputs with the very same strict rule checkpoint
+loading uses, so a map that could not be reloaded can never be created in the
+first place:
+
+- `width` and `height` must each be a positive plain integer. Booleans are
+  not integers here (`GridMap(True, 2)` is rejected), a float is never
+  coerced (`3.0` is rejected even though it equals `3`), and zero, negative
+  numbers, strings and nulls raise `ValueError`, naming whether the width or
+  the height is at fault.
+- every obstacle must be a tuple of exactly two plain integers inside the
+  map: `x` ranges from `0` to `width - 1` and `y` from `0` to `height - 1`.
+  Boolean and float components are refused (so `(1.0, 0)` and `(True, 0)`
+  never silently name a cell), as are strings, nulls, single numbers, list
+  cells and tuples with missing or extra components; the `ValueError`
+  identifies the offending obstacle (and its index in an ordered input)
+  rather than surfacing a `TypeError`. A coordinate outside the map rejects
+  the whole map — it is never truncated or ignored. An empty collection
+  means no obstacles, and a coordinate supplied more than once counts once.
+
 ## Taking over in-flight work
 
 A fleet does not have to start idle: `FleetSimulator` accepts robots and tasks
