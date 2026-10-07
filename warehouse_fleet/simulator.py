@@ -273,6 +273,23 @@ exactly one place. Each version keeps its own handling on top: version 1
 rejects non-tick frames and fills in the missing ``type`` on a copy, while
 version 2 dispatches event types and enforces its map-change ordering.
 
+The two version 2 stores that both keep every accepted edit -- the
+independent ``map_changes`` history and the mirrored ``map_change`` replay
+events -- share the record format rather than maintaining it twice. The
+record itself is assembled by the single :func:`_canonical_map_change`
+builder (the same builder a live :meth:`modify_obstacles` uses for its return
+value), each record's object shape plus non-negative ``tick`` and positive
+``sequence`` type checks are read once by
+:meth:`FleetSimulator._read_map_change_stamp`, and the ``added``/``removed``
+cell lists are parsed by the shared
+:meth:`FleetSimulator._load_change_cells`. The two stores deliberately keep
+their own time and ordering rules on top, with their own wording: the
+history enforces sequences running consecutively from 1, non-decreasing
+ticks, a non-empty change and no cell both added and removed, while the
+replay enforces that an edit follows the tick frame it is stamped on and
+stays interspersed in record order (so edits take no tick number and tick-0
+edits may lead the replay).
+
 Both map definitions are validated by the single shared
 :meth:`FleetSimulator._load_map_definition` rule -- positive integer
 dimensions, an obstacle list of integer ``[x, y]`` pairs inside the map --
@@ -402,6 +419,31 @@ def _as_cell(value: object, description: str) -> Position:
 def _as_pair(value: object, description: str) -> tuple[int, int]:
     """Validate a checkpoint coordinate as a two-integer JSON list."""
     return _coordinate_pair(value, description, strict_list=True)
+
+
+def _canonical_map_change(
+    tick: int,
+    sequence: int,
+    added: Iterable[Position],
+    removed: Iterable[Position],
+) -> dict[str, object]:
+    """Build the one map-change record shape every store shares.
+
+    A map edit is recorded twice -- in the independent ``map_changes``
+    history and mirrored as a ``map_change`` replay event -- and a live edit
+    returns the same record to its caller. The shape is therefore assembled
+    here in exactly one place: a ``map_change`` object carrying the stamp and
+    sequence alongside ``added``/``removed`` lists of two-integer JSON
+    coordinates. The callers own validation and the distinct time/order
+    constraints of the two stores; this only fixes the record format.
+    """
+    return {
+        "type": "map_change",
+        "tick": tick,
+        "sequence": sequence,
+        "added": [list(cell) for cell in added],
+        "removed": [list(cell) for cell in removed],
+    }
 
 
 def _task_route_waypoints(origin: Position, task: Task) -> list[Position]:
@@ -1076,13 +1118,11 @@ class FleetSimulator:
     def _map_change_record(
         self, sequence: int, added: list[Position], removed: list[Position]
     ) -> dict[str, object]:
-        return {
-            "type": "map_change",
-            "tick": self.tick,
-            "sequence": sequence,
-            "added": [list(cell) for cell in added],
-            "removed": [list(cell) for cell in removed],
-        }
+        # The canonical record shape, stamped with the simulator's current
+        # tick; shared with the independent history and replay-event loaders
+        # via _canonical_map_change. This is also the value a fully vacuous
+        # edit returns (empty added/removed), so it performs no validation.
+        return _canonical_map_change(self.tick, sequence, added, removed)
 
     def _plan_route(
         self, robot: Robot, task: Task, start: Position | None = None
@@ -2312,6 +2352,39 @@ class FleetSimulator:
             cells.append(position)
         return cells
 
+    @staticmethod
+    def _read_map_change_stamp(
+        frame: object,
+        context: str,
+        *,
+        tick_error: str,
+        sequence_error: str,
+    ) -> tuple[int, int]:
+        """Read and type-check one map-change record's frame and stamp.
+
+        This is the common stamp rule shared by the two version 2 stores: the
+        record must be an object carrying a non-negative integer ``tick`` and
+        a positive integer ``sequence`` (JSON booleans never count as
+        either). The coordinates are parsed by the equally shared
+        :meth:`_load_change_cells`, and the record itself is assembled by the
+        single :func:`_canonical_map_change` builder, so the two stores never
+        drift on shape. Each store keeps its own wording -- passed in as
+        *tick_error*/*sequence_error* and already prefixed with its source
+        and position -- along with its own surrounding ordering rules (the
+        history's consecutive sequences and non-decreasing ticks, the
+        replay's follow-the-tick-frame interspersing), so neither location
+        reports the other's reason.
+        """
+        if not isinstance(frame, dict):
+            raise ValueError(f"{context} must be an object")
+        tick = frame.get("tick")
+        sequence = frame.get("sequence")
+        if not _is_int(tick) or tick < 0:
+            raise ValueError(tick_error)
+        if not _is_int(sequence) or sequence <= 0:
+            raise ValueError(sequence_error)
+        return tick, sequence
+
     @classmethod
     def _load_map_changes(cls, data: Mapping[str, object]) -> list[dict[str, object]]:
         raw = cls._require_field(data, "map_changes")
@@ -2322,14 +2395,12 @@ class FleetSimulator:
         last_sequence = 0
         for index, frame in enumerate(raw):
             context = f"map change {index}"
-            if not isinstance(frame, dict):
-                raise ValueError(f"{context} must be an object")
-            tick = frame.get("tick")
-            sequence = frame.get("sequence")
-            if not _is_int(tick) or tick < 0:
-                raise ValueError(f"{context} field 'tick' must be a non-negative integer")
-            if not _is_int(sequence) or sequence <= 0:
-                raise ValueError(f"{context} field 'sequence' must be a positive integer")
+            tick, sequence = cls._read_map_change_stamp(
+                frame,
+                context,
+                tick_error=f"{context} field 'tick' must be a non-negative integer",
+                sequence_error=f"{context} field 'sequence' must be a positive integer",
+            )
             if sequence != index + 1:
                 raise ValueError(
                     f"map change sequences must run consecutively from 1; change {index} "
@@ -2351,15 +2422,7 @@ class FleetSimulator:
                 raise ValueError(
                     f"{context} adds and removes the same cell {list(cell)}"
                 )
-            changes.append(
-                {
-                    "type": "map_change",
-                    "tick": tick,
-                    "sequence": sequence,
-                    "added": [list(cell) for cell in added],
-                    "removed": [list(cell) for cell in removed],
-                }
-            )
+            changes.append(_canonical_map_change(tick, sequence, added, removed))
             last_tick = tick
             last_sequence = sequence
         return changes
@@ -2428,18 +2491,19 @@ class FleetSimulator:
     def _replay_map_change_frames(
         cls, replay: Sequence[Mapping[str, object]]
     ) -> list[dict[str, object]]:
-        frames = [frame for frame in replay if frame.get("type") == "map_change"]
-        normalized = [
-            {
-                "type": "map_change",
-                "tick": frame["tick"],
-                "sequence": frame["sequence"],
-                "added": [list(cell) for cell in frame["added"]],
-                "removed": [list(cell) for cell in frame["removed"]],
-            }
-            for frame in frames
+        # Project the loaded replay onto just its map-change frames, rebuilt
+        # through the one canonical record shape so the comparison against the
+        # independent history ignores nothing extra and never aliases cells.
+        return [
+            _canonical_map_change(
+                frame["tick"],
+                frame["sequence"],
+                frame["added"],
+                frame["removed"],
+            )
+            for frame in replay
+            if frame.get("type") == "map_change"
         ]
-        return normalized
 
     @classmethod
     def _load_paused_tasks(cls, data: Mapping[str, object]) -> set[str]:
@@ -2681,12 +2745,25 @@ class FleetSimulator:
                 tick_index += 1
                 replay.append(frame)
             elif frame_type == "map_change":
-                tick = frame.get("tick")
-                sequence = frame.get("sequence")
-                if not _is_int(tick) or tick < 0:
-                    raise ValueError(f"replay frame {index} map change tick must be a non-negative integer")
-                if not _is_int(sequence) or sequence <= 0:
-                    raise ValueError(f"replay frame {index} map change sequence must be positive")
+                # The frame/object rule, the non-negative-tick and
+                # positive-sequence type checks, the cell lists and the record
+                # shape are all shared with the independent history (via
+                # _read_map_change_stamp, _load_change_cells and
+                # _canonical_map_change). What stays here is the replay's own
+                # interspersing rule and wording: an edit follows the tick
+                # frame it is stamped on and keeps record order.
+                context = f"replay frame {index}"
+                tick, sequence = cls._read_map_change_stamp(
+                    frame,
+                    context,
+                    tick_error=(
+                        f"replay frame {index} map change tick must be a "
+                        "non-negative integer"
+                    ),
+                    sequence_error=(
+                        f"replay frame {index} map change sequence must be positive"
+                    ),
+                )
                 if tick != tick_index:
                     raise ValueError(
                         f"replay map change {sequence} is stamped tick {tick} but appears "
@@ -2698,17 +2775,9 @@ class FleetSimulator:
                     raise ValueError(
                         f"replay map change {sequence} is out of order at tick {tick}"
                     )
-                added = cls._load_change_cells(frame.get("added"), f"replay frame {index}", "added")
-                removed = cls._load_change_cells(frame.get("removed"), f"replay frame {index}", "removed")
-                replay.append(
-                    {
-                        "type": "map_change",
-                        "tick": tick,
-                        "sequence": sequence,
-                        "added": [list(cell) for cell in added],
-                        "removed": [list(cell) for cell in removed],
-                    }
-                )
+                added = cls._load_change_cells(frame.get("added"), context, "added")
+                removed = cls._load_change_cells(frame.get("removed"), context, "removed")
+                replay.append(_canonical_map_change(tick, sequence, added, removed))
                 last_map_tick = tick
                 last_map_sequence = sequence
             else:
