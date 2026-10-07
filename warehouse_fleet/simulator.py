@@ -37,7 +37,17 @@ to face the very same unyielding jam further ahead, the opening is no opening
 and the retreat behind it is rejected as well. Yield moves count as
 mileage, waiting does not. The task keeps its original robot, pickup and
 completion rules are unchanged, and a robot paused by map unreachability never
-takes part in yielding. If no safe side cell exists the robots simply wait:
+takes part in yielding. A robot whose task finishes during a tick -- whether
+it drove onto the dropoff or finished standing on a coincident
+pickup/dropoff cell without moving -- must still stand on that dropoff when
+the tick ends, which is exactly the first-completion position evidence the
+replay and checkpoint loading require: it is never asked to yield for the
+rest of that same tick, even though it is already released and looks like a
+parked robot with a free side cell nearby, and a robot blocked behind it
+simply records a traffic wait. The hold lasts one tick only; on the next tick
+it yields like any parked robot, and a completion that is merely history in a
+later frame never restrains the robot. If no safe side cell exists the robots
+simply wait:
 time advances, nothing collides and nothing completes early. Waiting caused
 purely by other robots is tracked per robot (consecutive ticks and the
 blocking robot) and reported by :meth:`FleetSimulator.status` and
@@ -331,7 +341,7 @@ import copy
 import json
 import os
 import tempfile
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 
 from .model import GridMap, Position, Robot, Task
@@ -1161,7 +1171,9 @@ class FleetSimulator:
             if robot is not None:
                 self._refresh_bound_task_route(task, robot)
 
-    def _recover_paused_tasks(self) -> None:
+    def _recover_paused_tasks(
+        self, *, on_completion: Callable[[Robot], None] | None = None
+    ) -> None:
         """Resume map-paused tasks that the current map lets finish.
 
         This runs at the start of every tick, before ordinary assignment, so a
@@ -1176,6 +1188,12 @@ class FleetSimulator:
         remaining steps -- for example a loaded robot back at its dropoff, or
         coincident pickup/dropoff points -- is confirmed through the ordinary
         arrival rule on this same step instead of idling for a tick.
+
+        Such an immediate, zero-step completion leaves the robot parked on the
+        dropoff exactly like any other completion this tick: *on_completion* is
+        handed the finishing robot so the caller can hold it there until the
+        tick ends -- a completion that needs no movement is never followed by a
+        same-tick yield that pushes the robot off its delivery cell.
         """
         for task_id in sorted(self.paused_tasks):
             task = self.tasks.get(task_id)
@@ -1187,7 +1205,7 @@ class FleetSimulator:
                 self.paused_tasks.discard(task_id)
                 continue
             if self._refresh_bound_task_route(task, robot):
-                self._finish_if_arrived(robot)
+                self._finish_if_arrived(robot, on_completion=on_completion)
 
     # ------------------------------------------------------------------
     # Traffic conflicts and yielding
@@ -1267,6 +1285,7 @@ class FleetSimulator:
         occupied: dict[Position, str],
         reserved: dict[Position, str],
         already_moved: frozenset[str] = frozenset(),
+        cannot_yield: frozenset[str] = frozenset(),
     ) -> tuple[Position, list[Position]] | None:
         """Best side cell plus replanned route for a blocked robot, or None.
 
@@ -1279,6 +1298,10 @@ class FleetSimulator:
         with the deterministic neighbor order (up, left, right, down) breaking
         ties. *already_moved* names robots that have used their one move of
         this tick and therefore cannot vacate a cell to resolve the block.
+        *cannot_yield* names robots that may not leave their cell at all for
+        the rest of this tick even though they currently look parked -- robots
+        whose task finished earlier in this tick and must end it standing on
+        the delivery cell; next tick they yield like any parked robot.
         """
         if task is None or task.completed:
             return None
@@ -1299,7 +1322,14 @@ class FleetSimulator:
                 blocker_id is not None
                 and blocker_id != robot.robot_id
                 and self._is_bounceback_retreat(
-                    robot, cell, route, blocker_id, occupied, reserved, already_moved
+                    robot,
+                    cell,
+                    route,
+                    blocker_id,
+                    occupied,
+                    reserved,
+                    already_moved,
+                    cannot_yield,
                 )
             ):
                 # The replanned route immediately returns through the cell the
@@ -1320,6 +1350,7 @@ class FleetSimulator:
         occupied: dict[Position, str],
         reserved: dict[Position, str],
         already_moved: frozenset[str],
+        cannot_yield: frozenset[str] = frozenset(),
     ) -> bool:
         """Whether stepping to *side* only sends the robot back to the block.
 
@@ -1350,7 +1381,7 @@ class FleetSimulator:
             robot,
             hyp_occupied,
             reserved,
-            frozenset({robot.robot_id}) | already_moved,
+            frozenset({robot.robot_id}) | already_moved | cannot_yield,
             blocked_path,
         )
 
@@ -1398,7 +1429,10 @@ class FleetSimulator:
         dependency chain (including robots that used their one move of this
         tick), so meeting one again closes a cyclic dependency -- a head-on
         deadlock, or the requester itself -- and never proves an exit merely
-        because every robot on the cycle still carries a route.
+        because every robot on the cycle still carries a route. It also names
+        robots that finished a task earlier in this tick: they look parked but
+        must end the tick standing on their delivery cell, so they never
+        vacate for anyone.
         *blocked_path* holds the cells the retreating requester must drive
         back through: another robot parking there only moves the blockage, so
         such sidesteps do not count as leaving (driving on along the cell on
@@ -1682,8 +1716,23 @@ class FleetSimulator:
                 task.picked_up = True
 
     def step(self) -> dict[str, object]:
+        # Robots whose task finishes during this tick -- whether after driving
+        # onto the dropoff or without moving at all (in-place completion, or a
+        # map-paused task recovered into a zero-step route). Such a robot must
+        # still stand on the delivery cell when this tick ends: the replay's
+        # first-completion evidence and the checkpoint loader both require it
+        # there. It is therefore never asked to yield and never counts as able
+        # to vacate its cell for the rest of this tick. The set only lives for
+        # this tick -- on the next tick the robot is an ordinary parked robot
+        # again and yields normally, so finishing never turns the dropoff into
+        # a permanent reservation.
+        completed_now: set[str] = set()
+
+        def mark_finished(robot: Robot) -> None:
+            completed_now.add(robot.robot_id)
+
         self._confirm_pickups()
-        self._recover_paused_tasks()
+        self._recover_paused_tasks(on_completion=mark_finished)
         self.assign_tasks()
         # A robot assigned while already standing on the pickup cell collects
         # immediately instead of driving off without the goods.
@@ -1711,12 +1760,17 @@ class FleetSimulator:
             if robot.robot_id in moved_ids:
                 # Already yielded this tick at another robot's request.
                 continue
+            if robot.robot_id in completed_now:
+                # Its task finished earlier in this very tick and the robot is
+                # parked on the dropoff: it must end the tick there, so it
+                # neither drives for itself nor yields for anyone this tick.
+                continue
             task = self.tasks[robot.task_id] if robot.task_id is not None else None
             if task is not None and task.task_id in self.paused_tasks:
                 # Paused by map unreachability: stays put, never yields.
                 continue
             if not robot.route:
-                self._finish_if_arrived(robot)
+                self._finish_if_arrived(robot, on_completion=mark_finished)
                 continue
             destination = robot.route[0]
             if not self.grid.traversable(destination):
@@ -1732,25 +1786,27 @@ class FleetSimulator:
             if blocker_id is None or blocker_id == robot.robot_id:
                 relocate(robot, destination)
                 robot.route.pop(0)
-                self._finish_if_arrived(robot)
+                self._finish_if_arrived(robot, on_completion=mark_finished)
                 continue
             # Another robot is in the way; this is distinct from a
             # map-unreachability pause and the task stays active.
             blocker = self.robots[blocker_id]
-            if blocker_id not in moved_ids:
+            if blocker_id not in moved_ids and blocker_id not in completed_now:
                 if blocker.task_id is None and not blocker.route:
                     # Truly parked blocker: no bound task and no remaining
                     # route. Ask it to yield onto a free side cell, then take
                     # over the cell it vacated. A taskless robot that still has
                     # a remaining route is not parked: it drives that route
                     # cell by cell like any other moving robot and is never
-                    # pushed off it for a requester.
+                    # pushed off it for a requester. A robot that finished a
+                    # task earlier this tick looks parked but stays on the
+                    # dropoff until the tick ends (see ``completed_now``).
                     side = self._idle_sidestep_cell(blocker, robot, occupied, reserved)
                     if side is not None:
                         relocate(blocker, side)
                         relocate(robot, destination)
                         robot.route.pop(0)
-                        self._finish_if_arrived(robot)
+                        self._finish_if_arrived(robot, on_completion=mark_finished)
                         continue
                 if blocker.route:
                     ahead = blocker.route[0]
@@ -1766,13 +1822,18 @@ class FleetSimulator:
             # The blocker cannot or will not move this tick: try to sidestep
             # onto a free adjacent cell and replan from there.
             side = self._self_sidestep(
-                robot, task, occupied, reserved, frozenset(moved_ids)
+                robot,
+                task,
+                occupied,
+                reserved,
+                frozenset(moved_ids),
+                cannot_yield=frozenset(completed_now),
             )
             if side is not None:
                 cell, route = side
                 relocate(robot, cell)
                 robot.route = route
-                self._finish_if_arrived(robot)
+                self._finish_if_arrived(robot, on_completion=mark_finished)
                 continue
             waited.add(robot.robot_id)
         self._settle_traffic_waits(waited)
@@ -1789,7 +1850,12 @@ class FleetSimulator:
         # frame must never rewrite the history recorded here.
         return copy.deepcopy(event)
 
-    def _finish_if_arrived(self, robot: Robot) -> None:
+    def _finish_if_arrived(
+        self,
+        robot: Robot,
+        *,
+        on_completion: Callable[[Robot], None] | None = None,
+    ) -> None:
         if robot.task_id is None:
             return
         task = self.tasks[robot.task_id]
@@ -1801,6 +1867,8 @@ class FleetSimulator:
             task.completed = True
             self.paused_tasks.discard(task.task_id)
             robot.task_id = None
+            if on_completion is not None:
+                on_completion(robot)
 
     def metrics(self) -> dict[str, object]:
         completed = sum(task.completed for task in self.tasks.values())

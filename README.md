@@ -530,6 +530,24 @@ by doing so: it stays on its side cell once the way is clear and can still
 pick up tasks later. If no safe side cell exists, both robots simply wait —
 time advances, cargo and tasks are kept, and nothing collides or completes.
 
+### The completion tick
+
+When a task first finishes, the robot that executed it must still stand on
+the dropoff when that tick ends — this is what a replay frame's completion
+evidence and the checkpoint loader verify, so the rule covers both ways a
+delivery happens: a robot that walks onto the dropoff and finishes there, and
+a robot already standing on the coincident pickup/dropoff cell that finishes
+without moving. For the rest of that same tick the just-finished robot is
+therefore never asked to make way, even though it is already released from
+the task, looks like an ordinary parked robot and a free neighbouring cell
+exists: another robot whose route runs through the dropoff simply records a
+traffic wait for the tick. The hold lasts exactly one tick. On the next tick
+the robot is parked traffic like any other and yields normally — finishing a
+task never reserves the dropoff permanently, and a task that is merely
+historical (kept in later frames' cumulative `completed` lists) never limits
+its robot's later movement. A task whose robot has not reached the dropoff
+still cannot complete early.
+
 Traffic waits are reported separately from map pauses:
 
 ```python
