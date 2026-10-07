@@ -56,8 +56,14 @@ def build_document():
             return json.load(handle)
 
 
-def with_history(document, frames, *, completed=()):
-    """Attach a replay history and mark *completed* tasks as done."""
+def with_history(document, frames, *, completed=(), owners=None):
+    """Attach a replay history and mark *completed* tasks as done.
+
+    *owners* optionally records the historical delivery robot per task; every
+    completed task without an explicit owner keeps ``"A"`` (the robot is idle
+    again by the time the checkpoint is saved).
+    """
+    owners = owners or {}
     tick_frames = [frame for frame in frames if frame["type"] == "tick"]
     document["tick"] = len(tick_frames)
     document["replay"] = frames
@@ -77,7 +83,7 @@ def with_history(document, frames, *, completed=()):
         record["picked_up"] = True
         record["completed"] = True
         # Completed tasks keep their historical owner; the robot is idle now.
-        record["assigned_robot"] = "A"
+        record["assigned_robot"] = owners.get(task_id, "A")
     return document
 
 
@@ -115,11 +121,12 @@ class CompletionHistoryAcceptanceTests(unittest.TestCase):
         document = with_history(
             build_document(),
             [
-                tick_frame(1, [], POSITIONS),
-                tick_frame(2, [], POSITIONS, ["T1"]),
-                tick_frame(3, [], POSITIONS, ["T1", "T2"]),
+                tick_frame(1, ["A"], {"A": (1, 0), "B": (4, 1)}),
+                tick_frame(2, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+                tick_frame(3, ["B"], {"A": (2, 0), "B": (4, 0)}, ["T1", "T2"]),
             ],
             completed=("T1", "T2"),
+            owners={"T1": "A", "T2": "B"},
         )
         loaded = load(document)
         self.assertEqual(loaded.tick, 3)
@@ -138,15 +145,33 @@ class CompletionHistoryAcceptanceTests(unittest.TestCase):
         loaded = load(document)
         self.assertTrue(loaded.tasks["T1"].completed)
 
+    def test_historical_owner_may_have_left_the_fleet_in_first_frame(self):
+        # A completion already present in the first frame may predate the
+        # recording, delivered by a robot no longer in the fleet.
+        document = with_history(
+            build_document(),
+            [tick_frame(1, [], POSITIONS, ["T1"])],
+            completed=("T1",),
+            owners={"T1": "GONE"},
+        )
+        loaded = load(document)
+        self.assertEqual(loaded.tasks["T1"].assigned_robot, "GONE")
+
     def test_order_within_frame_and_repeats_across_frames_are_legal(self):
         document = with_history(
             build_document(),
             [
-                tick_frame(1, [], POSITIONS, ["T1"]),
-                tick_frame(2, [], POSITIONS, ["T1"]),
-                tick_frame(3, [], POSITIONS, ["T2", "T1"]),
+                tick_frame(1, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+                tick_frame(2, [], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+                tick_frame(
+                    3,
+                    ["B"],
+                    {"A": (2, 0), "B": (4, 0)},
+                    ["T2", "T1"],
+                ),
             ],
             completed=("T1", "T2"),
+            owners={"T1": "A", "T2": "B"},
         )
         loaded = load(document)
         self.assertEqual(loaded.replay[2]["completed"], ["T2", "T1"])
@@ -177,8 +202,8 @@ class CompletionHistoryAcceptanceTests(unittest.TestCase):
 
     def test_legit_history_preserves_tasks_replay_and_metrics(self):
         frames = [
-            tick_frame(1, [], POSITIONS),
-            tick_frame(2, [], POSITIONS, ["T1"]),
+            tick_frame(1, ["A"], {"A": (1, 0), "B": (4, 1)}),
+            tick_frame(2, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
         ]
         document = with_history(build_document(), frames, completed=("T1",))
         loaded = load(document)
@@ -281,10 +306,11 @@ class CompletionHistoryRejectionTests(unittest.TestCase):
             with_history(
                 build_document(),
                 [
-                    tick_frame(1, [], POSITIONS, ["T1"]),
-                    tick_frame(2, [], POSITIONS, ["T1", "T2"]),
+                    tick_frame(1, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+                    tick_frame(2, ["B"], {"A": (2, 0), "B": (4, 0)}, ["T1", "T2"]),
                 ],
                 completed=("T1", "T2"),
+                owners={"T1": "A", "T2": "B"},
             )
         )
         loaded = load(document)
@@ -301,12 +327,207 @@ class CompletionHistoryRejectionTests(unittest.TestCase):
         self.assertEqual(document["replay"][0]["completed"], ["T1"])
 
 
-class ResumeCliCompletionTests(unittest.TestCase):
-    def resume(self, steps):
+class CompletionLocationAcceptanceTests(unittest.TestCase):
+    def test_robot_at_dropoff_when_task_first_completed_loads(self):
         document = with_history(
             build_document(),
-            [tick_frame(1, [], POSITIONS, ["T1"])],
+            [
+                tick_frame(1, ["A"], {"A": (1, 0), "B": (4, 1)}),
+                tick_frame(2, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+            ],
+            completed=("T1",),
         )
+        loaded = load(document)
+        self.assertTrue(loaded.tasks["T1"].completed)
+        self.assertEqual(loaded.tasks["T1"].assigned_robot, "A")
+
+    def test_task_may_complete_without_the_robot_moving_that_tick(self):
+        # A is already standing on the dropoff when the tick begins and waits
+        # there; finishing needs no movement, so 'moved' need not list it.
+        document = with_history(
+            build_document(),
+            [
+                tick_frame(1, ["B"], {"A": (2, 0), "B": (3, 1)}),
+                tick_frame(2, [], {"A": (2, 0), "B": (3, 1)}, ["T1"]),
+            ],
+            completed=("T1",),
+        )
+        loaded = load(document)
+        self.assertTrue(loaded.tasks["T1"].completed)
+        self.assertEqual(loaded.replay[1]["moved"], [])
+
+    def test_robot_may_leave_the_dropoff_in_a_later_frame(self):
+        document = with_history(
+            build_document(),
+            [
+                tick_frame(1, ["A"], {"A": (1, 0), "B": (4, 1)}),
+                tick_frame(2, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+                tick_frame(3, ["A"], {"A": (1, 0), "B": (4, 1)}, ["T1"]),
+            ],
+            completed=("T1",),
+        )
+        loaded = load(document)
+        self.assertEqual(loaded.robots["A"].position, (1, 0))
+        self.assertTrue(loaded.tasks["T1"].completed)
+
+    def test_repeating_a_completion_never_reopens_the_location_check(self):
+        # Only the frame in which T1 first appears is judged; later frames may
+        # keep listing it while A works far away from the dropoff.
+        document = with_history(
+            build_document(),
+            [
+                tick_frame(1, ["A"], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+                tick_frame(2, ["A"], {"A": (1, 0), "B": (4, 1)}, ["T1"]),
+                tick_frame(3, ["A"], {"A": (0, 0), "B": (4, 1)}, ["T1"]),
+            ],
+            completed=("T1",),
+        )
+        loaded = load(document)
+        self.assertEqual(loaded.robots["A"].position, (0, 0))
+
+    def test_map_change_between_frames_keeps_the_location_requirement(self):
+        frames = [
+            tick_frame(1, ["A"], {"A": (2, 0), "B": (4, 1)}),
+            map_change(1, 1, added=((0, 1),)),
+            tick_frame(2, [], {"A": (2, 0), "B": (4, 1)}, ["T1"]),
+        ]
+        document = with_history(build_document(), frames, completed=("T1",))
+        document["map_changes"] = [map_change(1, 1, added=((0, 1),))]
+        document["grid"]["obstacles"] = [[0, 1]]
+        loaded = load(document)
+        self.assertEqual(loaded.tick, 2)
+        self.assertEqual(loaded.grid.obstacles, frozenset({(0, 1)}))
+        self.assertTrue(loaded.tasks["T1"].completed)
+
+    def test_real_delivery_round_trip_preserves_tasks_replay_and_metrics(self):
+        simulator = FleetSimulator(
+            GridMap(5, 2),
+            [Robot("A", (0, 0)), Robot("B", (4, 1))],
+            [Task("T1", (1, 0), (2, 0)), Task("T2", (3, 1), (4, 0))],
+        )
+        while simulator.metrics()["tasks_completed"] < 2:
+            simulator.step()
+        snapshot = simulator.snapshot()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state.json")
+            simulator.save_checkpoint(path)
+            loaded = FleetSimulator.load_checkpoint(path)
+        self.assertEqual(loaded.snapshot()["tasks"], snapshot["tasks"])
+        self.assertEqual(loaded.replay, snapshot["replay"])
+        self.assertEqual(loaded.metrics(), snapshot["metrics"])
+
+
+class CompletionLocationRejectionTests(unittest.TestCase):
+    def test_robot_away_from_dropoff_when_task_completed_rejected(self):
+        document = with_history(
+            build_document(),
+            [
+                tick_frame(1, [], POSITIONS),
+                tick_frame(2, [], POSITIONS, ["T1"]),
+            ],
+            completed=("T1",),
+        )
+        expect_rejected(self, document, "2", "T1", "A", "dropoff", "[2, 0]", "[0, 0]")
+
+    def test_delivery_robot_missing_from_frame_rejected(self):
+        frame_two = {
+            "type": "tick",
+            "tick": 2,
+            "moved": [],
+            "robots": {"B": [4, 1]},
+            "completed": ["T1"],
+        }
+        document = with_history(
+            build_document(),
+            [tick_frame(1, [], POSITIONS), frame_two],
+            completed=("T1",),
+        )
+        expect_rejected(self, document, "2", "T1", "A", "absent")
+
+    def test_retired_owner_allowed_for_history_but_not_a_new_completion(self):
+        # A retired robot may own a completion already present in frame 1, but
+        # a task first completed in a later frame still needs that robot
+        # present and on the dropoff in that very frame.
+        frame_two = {
+            "type": "tick",
+            "tick": 2,
+            "moved": [],
+            "robots": {"A": [0, 0], "B": [4, 1]},
+            "completed": ["T1"],
+        }
+        document = with_history(
+            build_document(),
+            [tick_frame(1, [], POSITIONS), frame_two],
+            completed=("T1",),
+            owners={"T1": "GONE"},
+        )
+        expect_rejected(self, document, "2", "T1", "GONE", "absent")
+
+    def test_another_robot_on_the_dropoff_does_not_count(self):
+        # B happens to stand on T1's dropoff, but T1's recorded delivery robot
+        # is A, and A is nowhere near it.
+        positions = {"A": (0, 0), "B": (2, 0)}
+        document = with_history(
+            build_document(),
+            [
+                tick_frame(1, [], positions),
+                tick_frame(2, [], positions, ["T1"]),
+            ],
+            completed=("T1",),
+        )
+        expect_rejected(self, document, "T1", "A", "dropoff")
+
+    def test_map_change_cannot_stand_in_for_completion_frame_evidence(self):
+        # The edit between the frames is not a time step: T1 still has to be
+        # delivered in tick frame 2 itself.
+        frames = [
+            tick_frame(1, [], POSITIONS),
+            map_change(1, 1, added=((1, 1),)),
+            tick_frame(2, [], POSITIONS, ["T1"]),
+        ]
+        document = with_history(build_document(), frames, completed=("T1",))
+        document["map_changes"] = [map_change(1, 1, added=((1, 1),))]
+        document["grid"]["obstacles"] = [[1, 1]]
+        expect_rejected(self, document, "2", "T1", "A", "dropoff")
+
+    def test_version_one_robot_away_from_dropoff_rejected(self):
+        document = as_version_one(
+            with_history(
+                build_document(),
+                [
+                    tick_frame(1, [], POSITIONS),
+                    tick_frame(2, [], POSITIONS, ["T1"]),
+                ],
+                completed=("T1",),
+            )
+        )
+        expect_rejected(self, document, "2", "T1", "A", "dropoff")
+
+    def test_version_one_delivery_robot_missing_from_frame_rejected(self):
+        frame_two = {
+            "type": "tick",
+            "tick": 2,
+            "moved": [],
+            "robots": {"B": [4, 1]},
+            "completed": ["T1"],
+        }
+        document = as_version_one(
+            with_history(
+                build_document(),
+                [tick_frame(1, [], POSITIONS), frame_two],
+                completed=("T1",),
+            )
+        )
+        expect_rejected(self, document, "2", "T1", "A", "absent")
+
+
+class ResumeCliCompletionTests(unittest.TestCase):
+    def resume(self, steps, document=None, fragment="T1"):
+        if document is None:
+            document = with_history(
+                build_document(),
+                [tick_frame(1, [], POSITIONS, ["T1"])],
+            )
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "state.json")
             output = os.path.join(tmpdir, "next.json")
@@ -323,7 +544,7 @@ class ResumeCliCompletionTests(unittest.TestCase):
             self.assertEqual(context.exception.code, 1)
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("resume:", stderr.getvalue())
-            self.assertIn("T1", stderr.getvalue())
+            self.assertIn(fragment, stderr.getvalue())
             with open(path, "rb") as handle:
                 self.assertEqual(handle.read(), original)
             self.assertFalse(os.path.exists(output))
@@ -333,6 +554,26 @@ class ResumeCliCompletionTests(unittest.TestCase):
 
     def test_resume_with_zero_steps_still_validates(self):
         self.resume(0)
+
+    def forged_delivery_document(self):
+        # T1 is first recorded as completed in frame 2 while its delivery
+        # robot A still stands at (0, 0), nowhere near the (2, 0) dropoff.
+        return with_history(
+            build_document(),
+            [
+                tick_frame(1, [], POSITIONS),
+                tick_frame(2, [], POSITIONS, ["T1"]),
+            ],
+            completed=("T1",),
+        )
+
+    def test_resume_rejects_forged_delivery_location(self):
+        self.resume(5, self.forged_delivery_document())
+
+    def test_resume_rejects_forged_delivery_location_with_zero_steps(self):
+        # Even with no ticks to run, loading must fail: no simulation output on
+        # stdout and no output checkpoint written.
+        self.resume(0, self.forged_delivery_document())
 
 
 if __name__ == "__main__":
